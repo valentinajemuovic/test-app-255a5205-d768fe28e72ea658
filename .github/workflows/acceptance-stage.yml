@@ -1,0 +1,45 @@
+name: acceptance-stage
+
+run-name: >-
+  acceptance-stage${{ inputs.commit-sha && format(' [sha:{0}]', inputs.commit-sha) || ' [latest-image]' }}
+
+# Cloud acceptance stage: the real acceptance stage, in a production-like environment (Cloud Run).
+# It owns the release candidate (v<x.y.z>-rc.N) that QA consumes. Dispatch it
+# manually on a commit that passed the Docker Compose gates
+# (acceptance-stage-docker-compose[-legacy].yml).
+
+on:
+  # Manual only, to keep cloud costs at zero; uncomment to run it automatically.
+  # schedule:
+  #   - cron: '0 * * * *'  # Run every hour
+  workflow_dispatch:
+    inputs:
+      commit-sha:
+        description: 'Git SHA to test (leave empty for latest image)'
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: acceptance-stage
+
+jobs:
+  acceptance-stage:
+    permissions:
+      actions: write
+      contents: read
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/_acceptance-stage.yml
+    secrets: inherit
+    with:
+      architecture: multitier
+      language: typescript
+      test-language: typescript
+      images: '{"frontend":"test-app-255a5205-d768fe28e72ea658-frontend/frontend","backend":"test-app-255a5205-d768fe28e72ea658-backend/backend"}'
+      commit-sha: ${{ inputs.commit-sha }}
+      # Permanent environments on custom domains (docs/environments.md); unset = run.app only.
+      # setup-custom-domains.sh sets these once the domain mappings are ready.
+      acc-domain: ${{ vars.ACC_DOMAIN }}
+      e2e-domain: ${{ vars.E2E_DOMAIN }}

@@ -1,0 +1,233 @@
+import { expect } from '@playwright/test';
+import type { SystemError } from '../../../../driver/port/dtos/errors/SystemError.js';
+import type { BrowseCouponItem } from '../../../../driver/port/dtos/BrowseCouponsResponse.js';
+import type { UseCaseContext } from '../../shared/use-case-context.js';
+import type { AppContext } from '../app-context.js';
+import type { ScenarioContext } from '../scenario-context.js';
+import { Converter } from '../../../../common/converter.js';
+import { arrangeGiven } from '../given/arrange-given.js';
+
+export class ThenPublishCouponResultStage implements PromiseLike<void> {
+  private _expectSuccess = true;
+  private readonly _errorAssertions: ((error: SystemError, useCaseContext: UseCaseContext) => void)[] = [];
+  private readonly _couponAssertions: { code: string; fns: ((coupon: BrowseCouponItem) => void)[] }[] = [];
+  private _executionPromise: Promise<void> | null = null;
+
+  constructor(
+    private readonly app: AppContext,
+    private readonly ctx: ScenarioContext,
+    private readonly useCaseContext: UseCaseContext,
+    private readonly code: string,
+    private readonly discountRate: number | string,
+    private readonly validFrom?: string,
+    private readonly validTo?: string,
+    private readonly usageLimit?: number | string,
+  ) {}
+
+  shouldSucceed(): ThenPublishCouponSuccess {
+    this._expectSuccess = true;
+    return new ThenPublishCouponSuccess(this);
+  }
+
+  shouldFail(): ThenPublishCouponFailure {
+    this._expectSuccess = false;
+    return new ThenPublishCouponFailure(this);
+  }
+
+  _addErrorAssertion(fn: (error: SystemError, useCaseContext: UseCaseContext) => void): void {
+    this._errorAssertions.push(fn);
+  }
+
+  _addCouponAssertion(code: string, fn: (coupon: BrowseCouponItem) => void): void {
+    let entry = this._couponAssertions.find((e) => e.code === code);
+    if (!entry) {
+      entry = { code, fns: [] };
+      this._couponAssertions.push(entry);
+    }
+    entry.fns.push(fn);
+  }
+
+  private async execute(): Promise<void> {
+    if (this._executionPromise) return this._executionPromise;
+    this._executionPromise = this._doExecute();
+    return this._executionPromise;
+  }
+
+  private async _runCouponAssertions(): Promise<void> {
+    for (const couponEntry of this._couponAssertions) {
+      const resolvedCouponCode = this.useCaseContext.getParamValue(couponEntry.code);
+      const browseResult = await this.app.skyTravel().browseCoupons({});
+      expect(browseResult.success).toBe(true);
+      if (!browseResult.success) continue;
+      const coupon = browseResult.value.coupons.find((c) => c.code === resolvedCouponCode);
+      expect(coupon, `Coupon '${resolvedCouponCode}' not found in browse results`).toBeDefined();
+      if (coupon) {
+        for (const fn of couponEntry.fns) fn(coupon);
+      }
+    }
+  }
+
+  private async _doExecute(): Promise<void> {
+    // Given coupons (for the duplicate tests) and the rest of the declared givens are published the way every other then stage does.
+    await arrangeGiven(this.app, this.ctx, this.useCaseContext, { declaredOnly: true });
+
+    const resolvedCode = this.useCaseContext.getParamValue(this.code);
+    const result = await this.app.skyTravel('dynamic').publishCoupon({
+      code: resolvedCode,
+      discountRate: String(this.discountRate),
+      validFrom: this.validFrom,
+      validTo: this.validTo,
+      usageLimit: this.usageLimit === undefined ? undefined : String(this.usageLimit),
+    });
+
+    if (this._expectSuccess) {
+      expect(result.success, JSON.stringify(result)).toBe(true);
+      await this._runCouponAssertions();
+    } else {
+      expect(result.success, JSON.stringify(result)).toBe(false);
+      if (!result.success) {
+        for (const fn of this._errorAssertions) fn(result.error, this.useCaseContext);
+      }
+      await this._runCouponAssertions();
+    }
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.execute().then(onfulfilled, onrejected);
+  }
+}
+
+export class ThenPublishCouponSuccess implements PromiseLike<void> {
+  constructor(private readonly stage: ThenPublishCouponResultStage) {}
+
+  and(): this {
+    return this;
+  }
+
+  coupon(code: string): ThenPublishCouponCoupon {
+    return new ThenPublishCouponCoupon(this.stage, code);
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.stage.then(onfulfilled, onrejected);
+  }
+}
+
+export class ThenPublishCouponCoupon implements PromiseLike<void> {
+  constructor(
+    private readonly stage: ThenPublishCouponResultStage,
+    private readonly code: string,
+  ) {}
+
+  hasDiscountRate(rate: string | number): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      expect(Converter.normalizeDecimalOrNull(coupon.discountRate)).toBe(Converter.normalizeDecimal(rate));
+    });
+    return this;
+  }
+
+  isValidFrom(validFrom: string): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      expect(coupon.validFrom ? new Date(coupon.validFrom).getTime() : coupon.validFrom, 'validFrom').toBe(new Date(validFrom).getTime());
+    });
+    return this;
+  }
+
+  isValidTo(validTo: string): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      expect(coupon.validTo ? new Date(coupon.validTo).getTime() : coupon.validTo, 'validTo').toBe(new Date(validTo).getTime());
+    });
+    return this;
+  }
+
+  hasUsageLimit(limit: number): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      expect(coupon.usageLimit).toBe(limit);
+    });
+    return this;
+  }
+
+  isValidImmediately(): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      expect(coupon.validFrom ?? null, 'validFrom (valid immediately)').toBeNull();
+    });
+    return this;
+  }
+
+  neverExpires(): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      expect(coupon.validTo ?? null, 'validTo (never expires)').toBeNull();
+    });
+    return this;
+  }
+
+  hasUnlimitedUsage(): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      // The system stores "no usage limit" as 2147483647 (int max), which the UI shows as "Unlimited".
+      expect([null, 2147483647], 'usageLimit (unlimited)').toContain(coupon.usageLimit ?? null);
+    });
+    return this;
+  }
+
+  hasUsedCount(count: number): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      expect(coupon.usedCount).toBe(count);
+    });
+    return this;
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.stage.then(onfulfilled, onrejected);
+  }
+}
+
+export class ThenPublishCouponFailure implements PromiseLike<void> {
+  constructor(private readonly stage: ThenPublishCouponResultStage) {}
+
+  and(): this {
+    return this;
+  }
+
+  coupon(code: string): ThenPublishCouponCoupon {
+    return new ThenPublishCouponCoupon(this.stage, code);
+  }
+
+  errorMessage(expected: string): this {
+    this.stage._addErrorAssertion((error, useCaseContext) => {
+      expect(error.message).toBe(useCaseContext.expandAliases(expected));
+    });
+    return this;
+  }
+
+  noOrderPersisted(): this {
+    this.stage._addErrorAssertion((error) => {
+      expect(error, 'Expected the rejected operation to yield an error response (nothing persisted)').toBeDefined();
+    });
+    return this;
+  }
+
+  fieldErrorMessage(field: string, message: string): this {
+    this.stage._addErrorAssertion((error, useCaseContext) => {
+      const expandedMessage = useCaseContext.expandAliases(message);
+      const fieldError = error.fieldErrors.find((fe) => fe.field === field);
+      expect(fieldError?.message, `Expected field error for '${field}' in ${JSON.stringify(error.fieldErrors)}`).toBe(expandedMessage);
+    });
+    return this;
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.stage.then(onfulfilled, onrejected);
+  }
+}

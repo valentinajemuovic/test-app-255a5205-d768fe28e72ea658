@@ -1,0 +1,38 @@
+name: qa-stage
+
+# QA stage: deploys a release candidate created by the cloud acceptance stage
+# (acceptance-stage.yml) to QA on Cloud Run and records the deployment to the
+# qa environment, where qa-signoff.yml picks it up. To deploy with
+# Docker Compose instead, see the commented block in _qa-stage.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Prerelease version to deploy (e.g., v1.0.0-rc.1). Leave empty to deploy the latest available RC.'
+        required: false
+        type: string
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: qa-stage
+
+jobs:
+  qa-stage:
+    permissions:
+      actions: write
+      contents: read
+      id-token: write
+      packages: read
+    uses: ./.github/workflows/_qa-stage.yml
+    secrets: inherit
+    with:
+      architecture: multitier
+      language: typescript
+      test-language: typescript
+      images: '{"frontend":"test-app-255a5205-d768fe28e72ea658-frontend/frontend","backend":"test-app-255a5205-d768fe28e72ea658-backend/backend"}'
+      version: ${{ inputs.version }}
+      # setup-custom-domains.sh sets this once the domain mapping is ready.
+      domain: ${{ vars.QA_DOMAIN }}

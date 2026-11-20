@@ -1,0 +1,446 @@
+import AxeBuilder from '@axe-core/playwright';
+import type { Browser, BrowserContext, Page } from '@playwright/test';
+import type { Result } from '../../../../common/result.js';
+import { success, failure } from '../../../../common/result.js';
+import type { SystemError } from '../../../port/dtos/errors/SystemError.js';
+import { TestUsers, sameTestUser, type TestUser } from '../../shared/client/http/test-user.js';
+import { KeycloakUiLogin } from '../../shared/client/playwright/keycloak-ui-login.js';
+import { PAGE_TIMEOUT_MS } from './pages/BasePage.js';
+import { HomePage } from './pages/HomePage.js';
+import { CATALOG_READY_SELECTOR, CatalogPage } from './pages/CatalogPage.js';
+import { PRODUCT_READY_SELECTOR, ProductPage } from './pages/ProductPage.js';
+import { CART_READY_SELECTOR, CartPage } from './pages/CartPage.js';
+import { CHECKOUT_READY_SELECTOR, CheckoutPage } from './pages/CheckoutPage.js';
+import { CheckoutConfirmationPage } from './pages/CheckoutConfirmationPage.js';
+import { NEW_ORDER_READY_SELECTOR, NewOrderPage } from './pages/NewOrderPage.js';
+import { OrderHistoryPage } from './pages/OrderHistoryPage.js';
+import { ORDER_DETAILS_READY_SELECTOR, OrderDetailsPage } from './pages/OrderDetailsPage.js';
+import { COUPON_MANAGEMENT_READY_SELECTOR, CouponManagementPage } from './pages/CouponManagementPage.js';
+import { PROFILE_READY_SELECTOR, ProfilePage } from './pages/ProfilePage.js';
+
+const HOME_READY_SELECTOR = "a[href='/order-history']";
+const SINGLE_PAGE_APP_ROOT_SELECTOR = '#root';
+const LOGIN_FORM_SELECTOR = '#kc-login';
+const NOT_AUTHORIZED_SELECTOR = "h1:has-text('Not authorized'):visible";
+const NEW_ORDER_PATH = '/new-order';
+const COUPON_MANAGEMENT_PATH = '/admin-coupons';
+const PRODUCT_PATH = '/products/';
+const CART_PATH = '/cart';
+const CHECKOUT_PATH = '/checkout';
+const PROFILE_PATH = '/account';
+const PROCEED_TO_CHECKOUT_SELECTOR = "a[aria-label='Proceed to Checkout']";
+const FORBIDDEN_STATUS = 403;
+
+export const AUTHENTICATION_REQUIRED = 'Authentication is required';
+export const PERMISSION_DENIED = 'You do not have permission to perform this action';
+
+export class SkyTravelUiClient {
+  private context: BrowserContext | null = null;
+  private currentPage: Page | null = null;
+  private login: KeycloakUiLogin | undefined;
+  private lastResponseStatus: number | undefined;
+  /** Set while the browser session is a visitor's, which never logs in. */
+  private visitorSession = false;
+
+  /**
+   * @param keycloakBaseUrl when undefined or empty, the app is assumed to have no login screen.
+   */
+  constructor(
+    private readonly baseUrl: string,
+    private readonly browser: Browser,
+    private readonly keycloakBaseUrl?: string,
+  ) {
+    this.login = KeycloakUiLogin.forBaseUrl(keycloakBaseUrl, TestUsers.CUSTOMER);
+  }
+
+  /**
+   * Makes `user` the logged-in user. Switching discards the browser session (the next openHomePage()
+   * creates a fresh isolated context and logs in as the new user). No-op without Keycloak or when already that user.
+   */
+  async switchUser(user: TestUser): Promise<void> {
+    if (!this.login || sameTestUser(this.login.getUser(), user)) return;
+    await this.close();
+    this.login = KeycloakUiLogin.forBaseUrl(this.keycloakBaseUrl, user);
+  }
+
+  async openHomePage(): Promise<Result<HomePage, SystemError>> {
+    try {
+      if (!this.context) {
+        this.context = await this.browser.newContext({ viewport: { width: 1920, height: 1080 } });
+        this.currentPage = await this.context.newPage();
+      }
+      const page = this.requirePage();
+      const response = await page.goto(this.baseUrl);
+      if (response?.status() === 200) {
+        await this.login?.ensureLoggedIn(page, HOME_READY_SELECTOR);
+        return success(new HomePage(page));
+      }
+      return failure({ message: `SkyTravel UI not available: ${response?.status()}`, fieldErrors: [] });
+    } catch (e) {
+      return failure({ message: `SkyTravel UI not available: ${String(e)}`, fieldErrors: [] });
+    }
+  }
+
+  /** Opens the catalog, the home page, as the logged-in user. */
+  async openCatalog(): Promise<Result<CatalogPage, SystemError>> {
+    const result = await this.openHomePage();
+    if (!result.success) return failure(result.error);
+    return success(new CatalogPage(this.requirePage()));
+  }
+
+  /**
+   * Opens the catalog in a fresh session that never logs in.
+   * @returns the catalog, or null when the app sends the visitor to the login form instead
+   */
+  async openCatalogAnonymously(): Promise<CatalogPage | null> {
+    await this.close();
+    this.context = await this.browser.newContext({ viewport: { width: 1920, height: 1080 } });
+    this.currentPage = await this.context.newPage();
+    const page = this.currentPage;
+    await page.goto(this.baseUrl);
+    await page
+      .locator(`${CATALOG_READY_SELECTOR}, ${LOGIN_FORM_SELECTOR}`)
+      .waitFor({ state: 'visible', timeout: PAGE_TIMEOUT_MS });
+    if (this.login?.isLoginPage(page)) {
+      return null;
+    }
+    return new CatalogPage(page);
+  }
+
+  /** Replaces the browser session with a fresh one that never logs in: the anonymous visitor's. */
+  async startVisitorSession(): Promise<void> {
+    await this.close();
+    this.context = await this.browser.newContext({ viewport: { width: 1920, height: 1080 } });
+    this.currentPage = await this.context.newPage();
+    this.visitorSession = true;
+  }
+
+  /**
+   * Opens a product by its page address, in the visitor's session if one was started, else as the logged-in user.
+   * @returns the product page, or null when the app sends the visitor to the login form instead
+   */
+  async openProductPage(sku: string): Promise<Result<ProductPage | null, SystemError>> {
+    const path = `${PRODUCT_PATH}${encodeURIComponent(sku)}`;
+    if (this.visitorSession) {
+      const page = this.requirePage();
+      await page.goto(`${this.baseUrl}${path}`);
+      await page
+        .locator(`${PRODUCT_READY_SELECTOR}, ${LOGIN_FORM_SELECTOR}`)
+        .first()
+        .waitFor({ state: 'visible', timeout: PAGE_TIMEOUT_MS });
+      return success(this.login?.isLoginPage(page) ? null : new ProductPage(page));
+    }
+    const result = await this.openHomePage();
+    if (!result.success) return failure(result.error);
+    await this.openDirectly(path);
+    return success(new ProductPage(this.requirePage()));
+  }
+
+  /**
+   * Opens the catalog in the visitor's session if one was started, else as the logged-in user.
+   * @returns the catalog, or null when the app sends the visitor to the login form instead
+   */
+  async openCatalogInSession(): Promise<Result<CatalogPage | null, SystemError>> {
+    if (!this.visitorSession) return this.openCatalog();
+    const page = this.requirePage();
+    await page.goto(this.baseUrl);
+    await page
+      .locator(`${CATALOG_READY_SELECTOR}, ${LOGIN_FORM_SELECTOR}`)
+      .first()
+      .waitFor({ state: 'visible', timeout: PAGE_TIMEOUT_MS });
+    return success(this.login?.isLoginPage(page) ? null : new CatalogPage(page));
+  }
+
+  /**
+   * Leaves the site in the same browser: the page is closed and a new, blank one takes its place, keeping the
+   * browser's cookies and storage. Open a page to come back.
+   */
+  async revisit(): Promise<void> {
+    if (!this.context) {
+      throw new Error('SkyTravelUiClient: a page must be open before the visitor can leave and come back');
+    }
+    await this.currentPage?.close();
+    this.currentPage = await this.context.newPage();
+  }
+
+  /** Signs in as `user` with the header's "Sign In" link, from the page that is open. */
+  async signIn(user: TestUser): Promise<void> {
+    const userLogin = KeycloakUiLogin.forBaseUrl(this.keycloakBaseUrl, user);
+    if (!userLogin) {
+      throw new Error('Signing in can only be exercised against a system with a login');
+    }
+    await userLogin.ensureLoggedIn(this.requirePage(), HOME_READY_SELECTOR);
+  }
+
+  /** Whether the page is the login form. */
+  isOnLoginPage(): boolean {
+    return this.login?.isLoginPage(this.requirePage()) ?? false;
+  }
+
+  /** The page that is open, read for what every page shows, such as the header's cart badge. */
+  /**
+   * Runs axe on the page that is open and returns its serious and critical violations, one readable line each
+   * (rule, impact, help, offending elements), like the frontend's screen-test helper (frontend-react/src/test/axe.ts).
+   */
+  async accessibilityViolations(): Promise<string[]> {
+    const results = await new AxeBuilder({ page: this.requirePage() }).analyze();
+    return results.violations
+      .filter((violation) => violation.impact === 'serious' || violation.impact === 'critical')
+      .map(
+        (violation) =>
+          `${violation.id} (${violation.impact}): ${violation.help} at ${violation.nodes.map((node) => node.target.join(' ')).join(', ')}`,
+      );
+  }
+
+  currentPageInSession(): HomePage {
+    return new HomePage(this.requirePage());
+  }
+
+  /**
+   * Opens the checkout by its page address in the current session, and waits until the app shows where it sent the
+   * user: the checkout, the cart, the login form or a refusal.
+   */
+  async openCheckoutPage(): Promise<Result<void, SystemError>> {
+    if (this.visitorSession) {
+      const response = await this.requirePage().goto(`${this.baseUrl}${CHECKOUT_PATH}`);
+      this.lastResponseStatus = response?.status();
+    } else {
+      const home = await this.openHomePage();
+      if (!home.success) return failure(home.error);
+      await this.openDirectly(CHECKOUT_PATH);
+    }
+    await this.waitForCheckoutOutcome();
+    return success(undefined);
+  }
+
+  /** Opens the cart in the current session and follows its "Proceed to checkout", like openCheckoutPage(). */
+  async proceedToCheckoutFromCart(): Promise<void> {
+    const cartPage = await this.openCartPage();
+    await cartPage.waitForLoaded();
+    await this.requirePage().locator(PROCEED_TO_CHECKOUT_SELECTOR).click({ timeout: PAGE_TIMEOUT_MS });
+    await this.waitForCheckoutOutcome();
+  }
+
+  /** Signs in as `user` on the login form that is open, and waits for the page the app returns to. */
+  async signInOnLoginForm(user: TestUser): Promise<void> {
+    const userLogin = KeycloakUiLogin.forBaseUrl(this.keycloakBaseUrl, user);
+    if (!userLogin) {
+      throw new Error('Signing in can only be exercised against a system with a login');
+    }
+    const page = this.requirePage();
+    await userLogin.ensureLoggedIn(page, `${CHECKOUT_READY_SELECTOR}, ${CART_READY_SELECTOR}, ${CATALOG_READY_SELECTOR}`);
+    // A single-page UI may show its (public) landing page while it still exchanges the login code, and only then
+    // move to the page the visitor came from: wait until the code is gone from the address.
+    await page.waitForURL((url) => !url.searchParams.has('code'), { timeout: PAGE_TIMEOUT_MS });
+    if ((await page.locator(CHECKOUT_READY_SELECTOR).count()) === 0 && page.url().includes(CHECKOUT_PATH)) {
+      await page.locator(CHECKOUT_READY_SELECTOR).waitFor({ state: 'visible', timeout: PAGE_TIMEOUT_MS });
+    }
+  }
+
+  /** Whether the app refused the page: a 403 response (server-rendered UIs) or a "Not authorized" page (React). */
+  async isRefused(): Promise<boolean> {
+    return this.isCheckoutForbidden() || (await this.requirePage().locator(NOT_AUTHORIZED_SELECTOR).count()) > 0;
+  }
+
+  /** The path of the page address that is open, such as "/cart". */
+  currentPath(): string {
+    return new URL(this.requirePage().url()).pathname;
+  }
+
+  checkoutPage(): CheckoutPage {
+    return new CheckoutPage(this.requirePage());
+  }
+
+  checkoutConfirmationPage(): CheckoutConfirmationPage {
+    return new CheckoutConfirmationPage(this.requirePage());
+  }
+
+  /** The cart that is open now, without opening it. */
+  cartPageInSession(): CartPage {
+    return new CartPage(this.requirePage());
+  }
+
+  private isCheckoutForbidden(): boolean {
+    return this.lastResponseStatus === FORBIDDEN_STATUS && this.requirePage().url().includes(CHECKOUT_PATH);
+  }
+
+  /** Each of these shows only on its own page, so exactly one of them shows once the app has decided. */
+  private async waitForCheckoutOutcome(): Promise<void> {
+    if (this.isCheckoutForbidden()) return;
+    await this.requirePage()
+      .locator(`${CHECKOUT_READY_SELECTOR}, ${CART_READY_SELECTOR}, ${LOGIN_FORM_SELECTOR}, ${NOT_AUTHORIZED_SELECTOR}`)
+      .first()
+      .waitFor({ state: 'visible', timeout: PAGE_TIMEOUT_MS });
+  }
+
+  /** Opens the cart in the current session. The app must already be open. */
+  async openCartPage(): Promise<CartPage> {
+    if (this.visitorSession) {
+      await this.requirePage().goto(`${this.baseUrl}${CART_PATH}`);
+    } else {
+      await this.openDirectly(CART_PATH);
+    }
+    return new CartPage(this.requirePage());
+  }
+
+  /** Opens the profile by its page address, as the logged-in user, and waits until it has loaded. */
+  async openProfilePage(): Promise<Result<ProfilePage, SystemError>> {
+    const home = await this.openHomePage();
+    if (!home.success) return failure(home.error);
+    await this.openDirectly(PROFILE_PATH);
+    const profilePage = new ProfilePage(this.requirePage());
+    await profilePage.waitForLoaded();
+    return success(profilePage);
+  }
+
+  /**
+   * Opens the profile by its page address in a fresh visitor session, signs in as `user` when the app asks to, and
+   * waits for the profile the app returns to.
+   */
+  async openProfilePageSigningIn(user: TestUser): Promise<ProfilePage> {
+    const userLogin = KeycloakUiLogin.forBaseUrl(this.keycloakBaseUrl, user);
+    if (!userLogin) {
+      throw new Error('Signing in can only be exercised against a system with a login');
+    }
+    await this.startVisitorSession();
+    const page = this.requirePage();
+    const response = await page.goto(`${this.baseUrl}${PROFILE_PATH}`);
+    this.lastResponseStatus = response?.status();
+    await userLogin.ensureLoggedIn(page, PROFILE_READY_SELECTOR);
+    // A single-page UI may show its (public) landing page while it still exchanges the login code, and only then
+    // move to the page the visitor came from: wait until the code is gone from the address.
+    await page.waitForURL((url) => !url.searchParams.has('code'), { timeout: PAGE_TIMEOUT_MS });
+    const profilePage = new ProfilePage(page);
+    await profilePage.waitForLoaded();
+    return profilePage;
+  }
+
+  /** Opens an order by its URL, not through the order history. The app must already be open. */
+  async openOrderDetailsPage(orderNumber: string): Promise<OrderDetailsPage> {
+    const encodedOrderNumber = encodeURIComponent(orderNumber);
+    await this.openDirectly(`/order-details/${encodedOrderNumber}`);
+    return new OrderDetailsPage(this.requirePage());
+  }
+
+  /**
+   * Pastes an order's URL into a fresh visitor session, signs in as `user` when the app asks to, and waits for the
+   * order details the app returns to. A single-page UI that drops the deep link across the login lands on its home
+   * page instead, so the order details never load.
+   */
+  async openOrderDetailsPageSigningIn(orderNumber: string, user: TestUser): Promise<OrderDetailsPage> {
+    const userLogin = KeycloakUiLogin.forBaseUrl(this.keycloakBaseUrl, user);
+    if (!userLogin) {
+      throw new Error('Signing in can only be exercised against a system with a login');
+    }
+    const encodedOrderNumber = encodeURIComponent(orderNumber);
+    await this.startVisitorSession();
+    const page = this.requirePage();
+    const response = await page.goto(`${this.baseUrl}/order-details/${encodedOrderNumber}`);
+    this.lastResponseStatus = response?.status();
+    await userLogin.ensureLoggedIn(page, ORDER_DETAILS_READY_SELECTOR);
+    // A single-page UI may show its (public) landing page while it still exchanges the login code, and only then
+    // move to the page the visitor came from: wait until the code is gone from the address.
+    await page.waitForURL((url) => !url.searchParams.has('code'), { timeout: PAGE_TIMEOUT_MS });
+    return new OrderDetailsPage(page);
+  }
+
+  /** Opens the new order page by its URL, reporting a refusal. The app must already be open. */
+  async openNewOrderPage(): Promise<Result<NewOrderPage, SystemError>> {
+    return this.openRestrictedPage(NEW_ORDER_PATH, NEW_ORDER_READY_SELECTOR, new NewOrderPage(this.requirePage()));
+  }
+
+  /** Opens the coupon management page by its URL, reporting a refusal. The app must already be open. */
+  async openCouponManagementPage(): Promise<Result<CouponManagementPage, SystemError>> {
+    return this.openRestrictedPage(
+      COUPON_MANAGEMENT_PATH,
+      COUPON_MANAGEMENT_READY_SELECTOR,
+      new CouponManagementPage(this.requirePage()),
+    );
+  }
+
+  /**
+   * Opens `path` in a throwaway session that never logs in, and requires the app to send it to the login form.
+   */
+  async assertLoginRequiredFor(path: string): Promise<void> {
+    if (!this.login) {
+      throw new Error('Anonymous access can only be exercised against a system with a login');
+    }
+    const anonymousContext = await this.browser.newContext();
+    try {
+      const anonymousPage = await anonymousContext.newPage();
+      await anonymousPage.goto(`${this.baseUrl}${path}`);
+      await this.login.waitForLoginForm(anonymousPage);
+    } finally {
+      await anonymousContext.close();
+    }
+  }
+
+  newOrderPage(): NewOrderPage {
+    return new NewOrderPage(this.requirePage());
+  }
+
+  orderHistoryPage(): OrderHistoryPage {
+    return new OrderHistoryPage(this.requirePage());
+  }
+
+  couponManagementPage(): CouponManagementPage {
+    return new CouponManagementPage(this.requirePage());
+  }
+
+  async close(): Promise<void> {
+    this.visitorSession = false;
+    if (this.currentPage) {
+      await this.currentPage.close();
+      this.currentPage = null;
+    }
+    if (this.context) {
+      await this.context.close();
+      this.context = null;
+    }
+  }
+
+  /** The server-rendered UIs refuse with a 403 response; the React frontend renders a "Not authorized" page. */
+  private async openRestrictedPage<T>(
+    path: string,
+    readySelector: string,
+    openedPage: T,
+  ): Promise<Result<T, SystemError>> {
+    await this.openDirectly(path);
+
+    if (this.lastResponseStatus === FORBIDDEN_STATUS) {
+      return failure({ message: PERMISSION_DENIED, fieldErrors: [] });
+    }
+
+    const page = this.requirePage();
+    await page
+      .locator(`${readySelector}, ${NOT_AUTHORIZED_SELECTOR}`)
+      .waitFor({ state: 'visible', timeout: PAGE_TIMEOUT_MS });
+
+    if ((await page.locator(NOT_AUTHORIZED_SELECTOR).count()) > 0) {
+      return failure({ message: PERMISSION_DENIED, fieldErrors: [] });
+    }
+    return success(openedPage);
+  }
+
+  /**
+   * Server-rendered UIs are simply navigated to. The React frontend keeps its session in memory and returns to
+   * the home page after the login redirect, so a reload would lose the URL: it is moved to the route in place.
+   */
+  private async openDirectly(path: string): Promise<void> {
+    const page = this.requirePage();
+    if ((await page.locator(SINGLE_PAGE_APP_ROOT_SELECTOR).count()) > 0) {
+      const route = JSON.stringify(path);
+      await page.evaluate(`history.pushState({}, '', ${route}); dispatchEvent(new PopStateEvent('popstate'));`);
+    } else {
+      const response = await page.goto(`${this.baseUrl}${path}`);
+      this.lastResponseStatus = response?.status();
+    }
+  }
+
+  private requirePage(): Page {
+    if (!this.currentPage) {
+      throw new Error('SkyTravelUiClient: openHomePage() must be called before accessing pages');
+    }
+    return this.currentPage;
+  }
+}

@@ -1,0 +1,963 @@
+name: _acceptance-stage
+
+# Acceptance stage on Cloud Run, shared by every variant: the real acceptance stage, in a
+# production-like environment. It owns the release candidate: on main it tags the tested
+# images and publishes <architecture>-<language>-v<x.y.z>-rc.N, which QA consumes. Callers
+# (<architecture>-<language>-acceptance-stage.yml) are dispatched manually on a commit that
+# passed the Docker Compose gates (_acceptance-stage-docker-compose.yml). Latest suites only;
+# legacy runs on Docker Compose only.
+#
+# Callers own the dispatch trigger, the workflow name and concurrency (github.workflow
+# resolves to the caller, so a group here would collide with the caller's and deadlock).
+#
+# Everything per-variant comes from <architecture>-<language>: the GitHub environment,
+# tag prefix, service and database names, and system/<architecture>/<language>/VERSION.
+# The test harness, gh-optivem config and systems.yaml come from the test language.
+#
+# Cloud Run deploys straight from public GHCR: the tested images by digest, and the shared
+# images (Keycloak, db-migrate, simulators, stubs) from ghcr.io/<owner>/<repo>/shop-*. The
+# shared images are tagged by the git tree hash of their build context, so a run that changes
+# nothing reuses them and Keycloak is not redeployed. That keeps one variant from restarting
+# Keycloak under another's tests.
+
+on:
+  workflow_call:
+    inputs:
+      architecture:
+        description: 'Architecture: multitier or monolith'
+        required: true
+        type: string
+      language:
+        description: 'Language: java, dotnet, or typescript'
+        required: true
+        type: string
+      test-language:
+        description: 'Language of the system tests (java, dotnet, or typescript); empty means the same as language'
+        required: false
+        type: string
+        default: ''
+      images:
+        description: 'JSON map of role to GHCR image name: {"frontend":"test-app-255a5205-d768fe28e72ea658-frontend/frontend","backend":"test-app-255a5205-d768fe28e72ea658-backend/backend"} or {"system":"monolith-system-java"}'
+        required: true
+        type: string
+      commit-sha:
+        description: 'Git SHA to test (leave empty for latest image)'
+        required: false
+        type: string
+        default: ''
+      # Custom domains of the permanent acceptance (stub) and E2E (real) environments, multitier only
+      # (docs/environments.md). The domain mapping is made once by setup-custom-domains.sh; here a set
+      # domain only becomes the UI URL the tests use, a CORS and Keycloak origin, and a deploy check.
+      # Empty (the default) keeps everything on run.app.
+      acc-domain:
+        description: 'Custom domain of the stub stack frontend (e.g. shop-acc.example.com); empty means run.app only'
+        required: false
+        type: string
+        default: ''
+      e2e-domain:
+        description: 'Custom domain of the real stack frontend (e.g. shop-e2e.example.com); empty means run.app only'
+        required: false
+        type: string
+        default: ''
+
+permissions: {}
+
+env:
+  COMMIT_SHA: ${{ inputs.commit-sha || github.sha }}
+  # Prefix for Cloud Run services, secrets and databases; set by setup-gcp.sh from the repo name
+  SYSTEM: ${{ vars.SYSTEM_NAME }}
+  # Custom domain of the shared Keycloak (setup-custom-domains.sh, docs/environments.md). Empty keeps
+  # Keycloak on run.app. Set: the public URL every backend, frontend and harness uses (the token issuer).
+  KEYCLOAK_DOMAIN: ${{ vars.KEYCLOAK_DOMAIN }}
+  ARCHITECTURE: ${{ inputs.architecture }}
+  PREFIX: ${{ inputs.architecture }}-${{ inputs.language }}
+  VERSION_FILE: VERSION
+  TEST_LANGUAGE: ${{ inputs.test-language || inputs.language }}
+
+jobs:
+  # === Gate: Artifacts Exist? ===
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    outputs:
+      image-urls: ${{ steps.images.outputs.urls }}
+      artifacts-exist: ${{ steps.check-artifacts.outputs.results && !contains(steps.check-artifacts.outputs.results, '"exists":false') }}
+      skip-reason: ${{ steps.check-artifacts.outputs.results && contains(steps.check-artifacts.outputs.results, '"exists":false') && 'Not all artifacts published yet — waiting for the commit stage to produce every image.' || '' }}
+    steps:
+      - name: Check Inputs Are Supported
+        run: |
+          if [[ "$ARCHITECTURE" != multitier && "$ARCHITECTURE" != monolith ]]; then
+            echo "::error::Unknown architecture '$ARCHITECTURE'."
+            exit 1
+          fi
+          if [[ "$TEST_LANGUAGE" != java && "$TEST_LANGUAGE" != dotnet && "$TEST_LANGUAGE" != typescript ]]; then
+            echo "::error::Unknown test language '$TEST_LANGUAGE'."
+            exit 1
+          fi
+
+      - name: Expand Image URLs
+        id: images
+        env:
+          IMAGES: ${{ inputs.images }}
+          BASE: ghcr.io/${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          {
+            echo 'urls<<EOF'
+            jq -r --arg base "$BASE" '.[] | "\($base)/\(.)"' <<< "$IMAGES"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check Container Packages Exist
+        id: check-artifacts
+        uses: optivem/actions/check-ghcr-packages-exist@v1
+        with:
+          image-urls: ${{ steps.images.outputs.urls }}
+          token: ${{ secrets.GHCR_TOKEN }}
+
+  # === Should Run? ===
+  check:
+    needs: preflight
+    if: needs.preflight.outputs.artifacts-exist == 'true'
+    runs-on: ubuntu-latest
+    environment: acceptance
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      should-run: ${{ steps.gate.outputs.should-run }}
+      skip-reason: ${{ steps.gate.outputs.skip-reason }}
+      image-digest-urls: ${{ steps.find-latest.outputs.image-digest-urls }}
+      latest-updated-at: ${{ steps.find-latest.outputs.latest-updated-at }}
+      last-run-at: ${{ steps.last-run.outputs.timestamp }}
+      on-main: ${{ steps.check-on-main.outputs.on-branch }}
+      base-version: ${{ steps.read-base-version.outputs.base-version }}
+    steps:
+      - name: Ensure Environment Variables Defined
+        uses: optivem/actions/validate-env-vars-defined@v1
+        with:
+          names: |
+            GCP_PROJECT_ID
+            GCP_REGION
+            GCP_WORKLOAD_IDENTITY_PROVIDER
+            GCP_SERVICE_ACCOUNT
+            SYSTEM_NAME
+            WORKFLOW_TOKEN
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          SYSTEM_NAME: ${{ vars.SYSTEM_NAME }}
+          WORKFLOW_TOKEN: ${{ secrets.WORKFLOW_TOKEN }}
+
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ env.COMMIT_SHA }}
+
+      - name: Check Commit on Main
+        id: check-on-main
+        uses: optivem/actions/check-sha-on-branch@v1
+        with:
+          commit-sha: ${{ env.COMMIT_SHA }}
+
+      - name: Read Base Version
+        id: read-base-version
+        uses: optivem/actions/read-base-version@v1
+        with:
+          file: ${{ env.VERSION_FILE }}
+
+      - name: Check System Release Already Published
+        id: check-tag
+        uses: optivem/actions/check-tag-exists@v1
+        with:
+          tag: v${{ steps.read-base-version.outputs.base-version }}
+
+      - name: Log in to GHCR
+        uses: optivem/actions/docker-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Resolve Docker Image Digests
+        id: find-latest
+        uses: optivem/actions/resolve-docker-image-digests@v1
+        with:
+          base-image-urls: ${{ needs.preflight.outputs.image-urls }}
+          tag: ${{ inputs.commit-sha && format('sha-{0}', inputs.commit-sha) || 'latest' }}
+
+      # With no commit-sha this stage tests each image's `latest` tag, which a red commit stage
+      # leaves at an older commit; the failure then looks like a code bug in this run (REL #67).
+      - name: Warn When a Tested Image's Commit Stage Is Red
+        if: inputs.commit-sha == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGES: ${{ inputs.images }}
+        run: |
+          set -euo pipefail
+          for image in $(jq -r '.[]' <<<"$IMAGES"); do
+            # monolith-system-<language> is built by monolith-<language>-commit-stage; the rest by <image>-commit-stage.
+            if [[ "$image" == monolith-system-* ]]; then
+              workflow="monolith-${image#monolith-system-}-commit-stage.yml"
+            else
+              workflow="${image}-commit-stage.yml"
+            fi
+            # Cancelled/skipped runs (concurrency, path filters) say nothing about the image; take the latest real one.
+            run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$workflow" --branch main --status completed \
+              --limit 20 --json conclusion,headSha,url               --jq '[.[] | select(.conclusion != "cancelled" and .conclusion != "skipped")][0] // empty')
+            if [[ -z "$run" ]]; then
+              echo "::warning::No completed $workflow run on main; cannot tell how current the $image:latest image is."
+              continue
+            fi
+            conclusion=$(jq -r .conclusion <<<"$run")
+            if [[ "$conclusion" != "success" ]]; then
+              msg="$workflow last finished '$conclusion' on main ($(jq -r '.headSha[0:8]' <<<"$run"), $(jq -r .url <<<"$run")): $image:latest is from an older commit, so failures here may come from the stale image, not from the code under test."
+              echo "::warning::$msg"
+              echo "- ⚠️ $msg" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: Get Last Workflow Run
+        id: last-run
+        uses: optivem/actions/get-last-workflow-run@v1
+        with:
+          workflow-name: ${{ github.workflow }}
+
+      - name: Check for New Artifacts Since Last Run
+        id: artifacts-changed
+        uses: optivem/actions/check-timestamp-newer@v1
+        with:
+          latest: ${{ steps.find-latest.outputs.latest-updated-at }}
+          since: ${{ steps.last-run.outputs.timestamp }}
+
+      - name: Detect Test Changes Since Last RC
+        id: test-changes
+        uses: optivem/actions/check-changes-since-tag@v1
+        with:
+          tag-patterns: v*-rc.*
+          paths: |
+            system-test
+            .github/workflows/acceptance-stage.yml
+            .github/workflows/_acceptance-stage.yml
+
+      - name: Evaluate Run Gate
+        id: gate
+        uses: optivem/actions/evaluate-run-gate@v1
+        with:
+          skip-conditions: |
+            [
+              {"when": ${{ steps.check-tag.outputs.exists == 'true' }}, "reason": "Release in progress — version already tagged, awaiting post-release VERSION bump."},
+              {"when": ${{ inputs.commit-sha == '' && steps.artifacts-changed.outputs.newer != 'true' && steps.test-changes.outputs.changed != 'true' }}, "reason": "No new artifacts since last run AND no test/workflow changes since last RC tag." }
+            ]
+
+  # === Build Shared Images into GHCR ===
+  shared-images:
+    needs: check
+    if: needs.check.outputs.should-run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: acceptance
+    permissions:
+      contents: read
+    outputs:
+      project-number: ${{ steps.project.outputs.project-number }}
+      db-migrate-image: ${{ steps.shared.outputs.db-migrate }}
+      keycloak-image: ${{ steps.shared.outputs.keycloak }}
+      simulators-image: ${{ steps.shared.outputs.simulators }}
+      stubs-image: ${{ steps.shared.outputs.stubs }}
+    steps:
+      # The workflow's own commit, for the local actions and Keycloak (see build-shared-images).
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Checkout Commit Under Test
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.COMMIT_SHA }}
+          path: source
+
+      - name: Log in to GHCR
+        uses: optivem/actions/docker-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Resolve Project Number
+        id: project
+        env:
+          WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        run: |
+          # The deployer SA has no resourcemanager.projects.get; the provider
+          # name is projects/<number>/locations/global/..., so read it from there.
+          PROJECT_NUMBER=$(cut -d/ -f2 <<< "$WIF_PROVIDER")
+          [[ "$PROJECT_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Cannot parse project number from GCP_WORKLOAD_IDENTITY_PROVIDER"; exit 1; }
+          echo "project-number=${PROJECT_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and Push Shared Images
+        id: shared
+        uses: ./.github/actions/build-shared-images
+        with:
+          registry: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+          source-path: source
+          public-images: ${{ needs.check.outputs.image-digest-urls }}
+
+  # === Deploy: Keycloak (shared by all variants) ===
+  deploy-keycloak:
+    needs: shared-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: acceptance
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Deploy Keycloak to Cloud Run
+        uses: ./.github/actions/deploy-keycloak
+        with:
+          image: ${{ needs.shared-images.outputs.keycloak-image }}
+          system: ${{ vars.SYSTEM_NAME }}
+          project: ${{ vars.GCP_PROJECT_ID }}
+          project-number: ${{ needs.shared-images.outputs.project-number }}
+          region: ${{ vars.GCP_REGION }}
+          keycloak-domain: ${{ vars.KEYCLOAK_DOMAIN }}
+          # The service account the system tests create customers with (realm shop only).
+          reconcile-system-test-admin: 'true'
+          system-test-admin-secret: ${{ secrets.KEYCLOAK_TEST_ADMIN_CLIENT_SECRET }}
+          frontend-origins: >-
+            ${{ inputs.acc-domain && format('https://{0}', inputs.acc-domain) || '' }}
+            ${{ inputs.e2e-domain && format('https://{0}', inputs.e2e-domain) || '' }}
+
+  # === Deploy: Real / Stub Stacks ===
+  deploy-stack:
+    needs: [check, shared-images, deploy-keycloak]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: acceptance
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - stack: real
+            ext-service: sim
+            ext-port: '9000'
+          - stack: stub
+            ext-service: stubs
+            ext-port: '8080'
+    env:
+      REGION: ${{ vars.GCP_REGION }}
+      PROJECT: ${{ vars.GCP_PROJECT_ID }}
+      PROJECT_NUMBER: ${{ needs.shared-images.outputs.project-number }}
+      # The tested images, by digest, straight from GHCR.
+      IMAGE_DIGEST_URLS: ${{ needs.check.outputs.image-digest-urls }}
+      BACKEND_IMAGE: ${{ fromJSON(inputs.images).backend }}
+      FRONTEND_IMAGE: ${{ fromJSON(inputs.images).frontend }}
+      SYSTEM_IMAGE: ${{ fromJSON(inputs.images).system }}
+      MIGRATE_IMAGE: ${{ needs.shared-images.outputs.db-migrate-image }}
+      STACK: ${{ matrix.stack }}
+      # Stub stack only (mirrors docker/*/*/docker-compose.*.stub.yml): a short breaker open time, and a breaker that
+      # opens only when every recent call failed, for every external system (ERP, Clock, Tax), so an outage test or one
+      # slow burst at the single stubs instance doesn't leak errors into the tests after it. Names per language: Java (Resilience4j), .NET (Polly), TypeScript.
+      STUB_BREAKER_ENV: >-
+        {"RESILIENCE_CIRCUITBREAKER_WAITINOPENSTATE":"100ms","RESILIENCE_CIRCUITBREAKER_FAILURERATETHRESHOLD":"100",
+        "Resilience__Erp__BreakDurationMilliseconds":"500","Resilience__Erp__FailureRatio":"1.0",
+        "Resilience__Clock__BreakDurationMilliseconds":"500","Resilience__Clock__FailureRatio":"1.0",
+        "Resilience__Tax__BreakDurationMilliseconds":"500","Resilience__Tax__FailureRatio":"1.0",
+        "EXTERNAL_BREAKER_HALF_OPEN_AFTER_MS":"100"}
+      EXT_SERVICE: ${{ matrix.ext-service }}
+      EXT_IMAGE: ${{ matrix.stack == 'real' && needs.shared-images.outputs.simulators-image || needs.shared-images.outputs.stubs-image }}
+      EXT_PORT: ${{ matrix.ext-port }}
+      DOMAIN: ${{ matrix.stack == 'real' && inputs.e2e-domain || matrix.stack == 'stub' && inputs.acc-domain || '' }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Resolve Stack Settings
+        run: |
+          set -euo pipefail
+          url() { echo "https://$1-${PROJECT_NUMBER}.${REGION}.run.app"; }
+          kc_url() { if [[ -n "$KEYCLOAK_DOMAIN" ]]; then echo "https://${KEYCLOAK_DOMAIN}"; else url "${SYSTEM}-keycloak"; fi; }
+          # image_ref <image name> <variable>: sets <variable> to the tested image's digest URL.
+          image_ref() {
+            local ref
+            ref="$(jq -r --arg n "/$1@" '.[] | select(contains($n))' <<< "$IMAGE_DIGEST_URLS")"
+            [[ -n "$ref" ]] || { echo "::error::No tested image for $1 in ${IMAGE_DIGEST_URLS}"; exit 1; }
+            printf -v "$2" '%s' "$ref"
+          }
+          if [[ "$ARCHITECTURE" == monolith ]]; then
+            image_ref "$SYSTEM_IMAGE" system_ref
+          else
+            image_ref "$BACKEND_IMAGE" backend_ref; image_ref "$FRONTEND_IMAGE" frontend_ref
+          fi
+          if [[ -n "$DOMAIN" && "$ARCHITECTURE" != multitier ]]; then
+            echo "::error::Custom domains (acc-domain / e2e-domain) are supported for multitier only"; exit 1
+          fi
+          p="${SYSTEM}-${PREFIX}-${STACK}"
+          db_name="${SYSTEM//-/_}_${PREFIX//-/_}_${STACK}"
+          {
+            echo "DB_NAME=${db_name}"
+            echo "SA=runtime@${PROJECT}.iam.gserviceaccount.com"
+            echo "EXT_NAME=${p}-${EXT_SERVICE}"
+            echo "MIGRATE_JOB=${p}-migrate"
+            echo "EXT_URL=$(url "${p}-${EXT_SERVICE}")"
+            echo "KEYCLOAK_URL=$(kc_url)"
+            if [[ "$ARCHITECTURE" == monolith ]]; then
+              echo "SYSTEM_SERVICE=${p}"
+              echo "SYSTEM_IMAGE_REF=${system_ref}"
+              echo "UI_HEALTH_URL=$(url "${p}")/health"
+              echo "API_HEALTH_URL=$(url "${p}")/health"
+            else
+              echo "BACKEND_NAME=${p}-backend"
+              echo "FRONTEND_NAME=${p}-frontend"
+              echo "BACKEND_IMAGE_REF=${backend_ref}"
+              echo "FRONTEND_IMAGE_REF=${frontend_ref}"
+              echo "BACKEND_URL=$(url "${p}-backend")"
+              echo "FRONTEND_URL=$(url "${p}-frontend")"
+              echo "ALLOWED_ORIGINS=$(url "${p}-frontend")${DOMAIN:+,https://${DOMAIN}}"
+              echo "UI_HEALTH_URL=$(url "${p}-frontend")/"
+              echo "API_HEALTH_URL=$(url "${p}-backend")/health"
+            fi
+          } >> "$GITHUB_ENV"
+
+      # One instance: both external-system images keep their state in memory (WireMock's stub mappings,
+      # json-server's products). With a second instance, a stub a test registers on one instance is
+      # missing on the other, and the backend's lookup there gets a 404 ("Product does not exist" /
+      # "Country does not exist") once parallel test load makes Cloud Run scale out.
+      - name: Deploy External Systems (${{ matrix.ext-service }})
+        run: |
+          set -euo pipefail
+          gcloud run deploy "$EXT_NAME" \
+            --image "$EXT_IMAGE" --region "$REGION" --project "$PROJECT" \
+            --service-account "$SA" --port "$EXT_PORT" --memory 1Gi \
+            --min-instances 0 --max-instances 1 --allow-unauthenticated
+
+      - name: Read DB Credentials
+        run: |
+          set -euo pipefail
+          db="$(gcloud secrets versions access latest --secret="${SYSTEM}-db")"
+          password="$(jq -r .password <<< "$db")"
+          echo "::add-mask::${password}"
+          {
+            echo "DB_HOST=$(jq -r .host <<< "$db")"
+            echo "DB_PORT=$(jq -r .port <<< "$db")"
+            echo "DB_USER=$(jq -r .user <<< "$db")"
+            echo "DB_PASSWORD=${password}"
+          } >> "$GITHUB_ENV"
+
+      # Flyway reads its settings from FLYWAY_* env vars (avoids comma-splitting of --args).
+      - name: Run DB Migrations
+        run: |
+          set -euo pipefail
+          env_file="${RUNNER_TEMP}/migrate-env.json"
+          jq -n \
+            --arg url "jdbc:postgresql://${DB_HOST}:${DB_PORT}/${DB_NAME}?sslmode=require" \
+            --arg user "$DB_USER" --arg pass "$DB_PASSWORD" \
+            '{FLYWAY_URL:$url, FLYWAY_USER:$user, FLYWAY_PASSWORD:$pass, FLYWAY_LOCATIONS:"filesystem:/flyway/sql"}' > "$env_file"
+          gcloud run jobs deploy "$MIGRATE_JOB" \
+            --image "$MIGRATE_IMAGE" --region "$REGION" --project "$PROJECT" \
+            --service-account "$SA" --args migrate --max-retries 0 --task-timeout 600 \
+            --env-vars-file "$env_file"
+          rm -f "$env_file"
+          gcloud run jobs execute "$MIGRATE_JOB" --region "$REGION" --project "$PROJECT" --wait
+
+      # Monolith runs the OIDC login itself, so it has to see the https the browser used, or Keycloak
+      # rejects the redirect URI: the two forwarded-header settings cover Java and .NET (TypeScript reads
+      # x-forwarded-proto itself). One instance, because Java and .NET keep sessions and login state in memory.
+      - name: Deploy System
+        if: inputs.architecture == 'monolith'
+        run: |
+          set -euo pipefail
+          env_file="${RUNNER_TEMP}/system-env.json"
+          jq -n \
+            --arg host "$DB_HOST" --arg port "$DB_PORT" --arg name "$DB_NAME" \
+            --arg user "$DB_USER" --arg pass "$DB_PASSWORD" \
+            --arg ext "$EXT_URL" --arg mode "$STACK" --arg kc "$KEYCLOAK_URL" \
+            '{POSTGRES_DB_HOST:$host, POSTGRES_DB_PORT:$port, POSTGRES_DB_NAME:$name,
+              POSTGRES_DB_USER:$user, POSTGRES_DB_PASSWORD:$pass, PGSSLMODE:"require",
+              ERP_API_URL:($ext + "/erp"), CLOCK_API_URL:($ext + "/clock"), TAX_API_URL:($ext + "/tax"),
+              EXTERNAL_SYSTEM_MODE:$mode,
+              AUTH_ISSUER_URI:($kc + "/realms/shop"),
+              AUTH_TOKEN_URI:($kc + "/realms/shop/protocol/openid-connect/token"),
+              AUTH_JWK_SET_URI:($kc + "/realms/shop/protocol/openid-connect/certs"),
+              AUTH_AUDIENCE:"shop-backend", AUTH_CLIENT_SECRET:"shop-monolith-test-secret",
+              SERVER_FORWARDHEADERSSTRATEGY:"native", ASPNETCORE_FORWARDEDHEADERS_ENABLED:"true"}
+             + (if $mode == "stub" then $stub_breaker else {} end)' \
+            --argjson stub_breaker "$STUB_BREAKER_ENV" > "$env_file"
+          gcloud run deploy "$SYSTEM_SERVICE" \
+            --image "$SYSTEM_IMAGE_REF" --region "$REGION" --project "$PROJECT" \
+            --service-account "$SA" --port 8080 --memory 1Gi --cpu 1 --cpu-boost \
+            --min-instances 0 --max-instances 1 --allow-unauthenticated \
+            --env-vars-file "$env_file"
+          rm -f "$env_file"
+
+      # PGSSLMODE: Neon requires TLS. JDBC and Npgsql negotiate it, but node-postgres only uses it when told.
+      - name: Deploy Backend
+        if: inputs.architecture == 'multitier'
+        run: |
+          set -euo pipefail
+          env_file="${RUNNER_TEMP}/backend-env.json"
+          jq -n \
+            --arg host "$DB_HOST" --arg port "$DB_PORT" --arg name "$DB_NAME" \
+            --arg user "$DB_USER" --arg pass "$DB_PASSWORD" \
+            --arg ext "$EXT_URL" --arg mode "$STACK" \
+            --arg origin "$ALLOWED_ORIGINS" --arg kc "$KEYCLOAK_URL" \
+            '{POSTGRES_DB_HOST:$host, POSTGRES_DB_PORT:$port, POSTGRES_DB_NAME:$name,
+              POSTGRES_DB_USER:$user, POSTGRES_DB_PASSWORD:$pass, PGSSLMODE:"require",
+              ERP_API_URL:($ext + "/erp"), CLOCK_API_URL:($ext + "/clock"), TAX_API_URL:($ext + "/tax"),
+              EXTERNAL_SYSTEM_MODE:$mode, ALLOWED_ORIGINS:$origin,
+              AUTH_ISSUER_URI:($kc + "/realms/shop"),
+              AUTH_JWK_SET_URI:($kc + "/realms/shop/protocol/openid-connect/certs"),
+              AUTH_AUDIENCE:"shop-backend"}
+             + (if $mode == "stub" then $stub_breaker else {} end)' \
+            --argjson stub_breaker "$STUB_BREAKER_ENV" > "$env_file"
+          gcloud run deploy "$BACKEND_NAME" \
+            --image "$BACKEND_IMAGE_REF" --region "$REGION" --project "$PROJECT" \
+            --service-account "$SA" --port 8081 --memory 1Gi --cpu 1 --cpu-boost \
+            --min-instances 0 --max-instances 2 --allow-unauthenticated \
+            --env-vars-file "$env_file"
+          rm -f "$env_file"
+
+      - name: Deploy Frontend
+        if: inputs.architecture == 'multitier'
+        run: |
+          set -euo pipefail
+          gcloud run deploy "$FRONTEND_NAME" \
+            --image "$FRONTEND_IMAGE_REF" --region "$REGION" --project "$PROJECT" \
+            --service-account "$SA" --port 3000 \
+            --min-instances 0 --max-instances 2 --allow-unauthenticated \
+            --set-env-vars "BACKEND_API_URL=${BACKEND_URL},KEYCLOAK_URL=${KEYCLOAK_URL},KEYCLOAK_REALM=shop,KEYCLOAK_CLIENT_ID=shop-frontend"
+
+      - name: Wait for Systems (${{ matrix.stack }})
+        uses: optivem/actions/wait-for-endpoints@v1
+        with:
+          endpoints: |
+            [
+              { "name": "SkyTravel UI", "url": "${{ env.UI_HEALTH_URL }}" },
+              { "name": "SkyTravel API", "url": "${{ env.API_HEALTH_URL }}" },
+              { "name": "ERP", "url": "${{ env.EXT_URL }}/erp/health" },
+              { "name": "Clock", "url": "${{ env.EXT_URL }}/clock/health" }
+            ]
+          max-attempts: '60'
+          wait-seconds: '10'
+          timeout-seconds: '900'
+
+      # The mapping (setup-custom-domains.sh) routes to the service, so this proves TLS and the route.
+      - name: Wait for Custom Domain (${{ matrix.stack }})
+        if: env.DOMAIN != ''
+        uses: optivem/actions/wait-for-endpoints@v1
+        with:
+          endpoints: |
+            [
+              { "name": "SkyTravel UI (${{ env.DOMAIN }})", "url": "https://${{ env.DOMAIN }}/" }
+            ]
+          max-attempts: '30'
+          wait-seconds: '10'
+          timeout-seconds: '300'
+
+  # === Run System Tests ===
+  run:
+    needs: [check, shared-images, deploy-stack]
+    if: needs.check.outputs.should-run == 'true'
+    runs-on: ubuntu-latest
+    # A hung suite must fail fast instead of burning GitHub's 6h job limit.
+    timeout-minutes: 90
+    environment: acceptance
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GH_OPTIVEM_CONFIG: gh-optivem.yaml
+      # Selects the acceptance environment in every test harness; every URL in it is overridden below.
+      ENVIRONMENT: acceptance
+      # Fresh customers per test: the harness signs in to the shared Keycloak as the test realm's service
+      # account (deploy-keycloak reconciles the client and sets this same secret), never as the master
+      # admin. The harness refuses any realm but shop, and shop-prod always.
+      KEYCLOAK_TEST_ADMIN_CLIENT_ID: shop-system-test-admin
+      KEYCLOAK_TEST_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_TEST_ADMIN_CLIENT_SECRET }}
+      KEYCLOAK_TEST_ADMIN_REALM: shop
+      REGION: ${{ vars.GCP_REGION }}
+      PROJECT_NUMBER: ${{ needs.shared-images.outputs.project-number }}
+      ACC_DOMAIN: ${{ inputs.acc-domain }}
+      E2E_DOMAIN: ${{ inputs.e2e-domain }}
+    outputs:
+      version: ${{ steps.rc-version.outputs.version }}
+      image-urls: ${{ steps.tag-images.outputs.tagged-image-urls }}
+    steps:
+      - name: Resolve System URLs
+        run: |
+          set -euo pipefail
+          url() { echo "https://$1-${PROJECT_NUMBER}.${REGION}.run.app"; }
+          kc_url() { if [[ -n "$KEYCLOAK_DOMAIN" ]]; then echo "https://${KEYCLOAK_DOMAIN}"; else url "${SYSTEM}-keycloak"; fi; }
+          for stack in real stub; do
+            p="${SYSTEM}-${PREFIX}-${stack}"
+            mode="${stack^^}"
+            ext="$(url "${p}-$([[ "$stack" == real ]] && echo sim || echo stubs)")"
+            if [[ "$ARCHITECTURE" == monolith ]]; then
+              ui="$(url "${p}")"; api="$ui"
+            else
+              # The custom domain, when set, fronts the frontend only; the backend stays on run.app.
+              domain="$([[ "$stack" == real ]] && echo "$E2E_DOMAIN" || echo "$ACC_DOMAIN")"
+              ui="${domain:+https://${domain}}"; ui="${ui:-$(url "${p}-frontend")}"; api="$(url "${p}-backend")"
+            fi
+            {
+              echo "MYSHOP_UI_BASE_URL_${mode}=${ui}"
+              echo "MYSHOP_API_BASE_URL_${mode}=${api}"
+              echo "ERP_API_BASE_URL_${mode}=${ext}/erp"
+              echo "CLOCK_API_BASE_URL_${mode}=${ext}/clock"
+              echo "TAX_API_BASE_URL_${mode}=${ext}/tax"
+              # Base of the external-systems service; the stub stack's is WireMock (failure evidence).
+              echo "EXTERNAL_BASE_URL_${mode}=${ext}"
+            } >> "$GITHUB_ENV"
+          done
+          # One Keycloak serves both stacks. KEYCLOAK_URL_<MODE> enables token acquisition in the
+          # Java and .NET harnesses (`system-test run` also exports them from systems.yaml).
+          kc="$(kc_url)"
+          {
+            echo "KEYCLOAK_URL=${kc}"
+            echo "KEYCLOAK_URL_REAL=${kc}"
+            echo "KEYCLOAK_URL_STUB=${kc}"
+          } >> "$GITHUB_ENV"
+
+      # === Checkout Code ===
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ env.COMMIT_SHA }}
+
+      - name: Log in to GHCR
+        uses: optivem/actions/docker-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      # === Setup Test Harness ===
+      - name: Setup Java
+        if: env.TEST_LANGUAGE == 'java'
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Setup Gradle
+        if: env.TEST_LANGUAGE == 'java'
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Pre-warm Gradle Wrapper (retry transient CDN flakes)
+        if: env.TEST_LANGUAGE == 'java'
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          command: cd system-test && ./gradlew --version
+
+      - name: Setup .NET
+        if: env.TEST_LANGUAGE == 'dotnet'
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Cache NuGet Packages
+        if: env.TEST_LANGUAGE == 'dotnet'
+        uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('system-test/**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Setup Node
+        if: env.TEST_LANGUAGE == 'typescript'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+          cache: 'npm'
+          cache-dependency-path: system-test/package-lock.json
+
+      - name: Cache Playwright Browsers
+        id: cache-playwright
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ (env.TEST_LANGUAGE == 'java' && hashFiles('system-test/build.gradle')) || (env.TEST_LANGUAGE == 'dotnet' && hashFiles('system-test/**/*.csproj')) || hashFiles('system-test/package-lock.json') }}
+
+      - name: Compile System Tests
+        # .NET-only pre-build: Java/TS pre-build implicitly via setupCommands.
+        # Required here so playwright.ps1 (in build output) exists for the
+        # suite's testInstallCommand to invoke.
+        if: env.TEST_LANGUAGE == 'dotnet'
+        run: dotnet build
+        working-directory: system-test
+
+      - name: Install gh-optivem CLI extension
+        uses: optivem/actions/install-gh-optivem@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The system is already deployed by earlier jobs, so no `gh optivem system start`.
+      - name: Setup Test Harness
+        run: gh optivem system-test setup
+
+      # `system-test run` health-probes systems.yaml and exports KEYCLOAK_URL_<MODE>
+      # from it, so the checkout's copy must name the deployed stack, not localhost.
+      # composeFile is required by the loader but unused: nothing is started here.
+      - name: Point systems.yaml at the Deployed Stack
+        run: |
+          set -euo pipefail
+          system_entry() {
+            local label="$1" ui="$2" api="$3" erp="$4" clock="$5"
+            local ui_name=Frontend api_name="Backend API" ui_health=""
+            if [[ "$ARCHITECTURE" == monolith ]]; then
+              ui_name=Monolith api_name="Monolith API"
+              ui_health=$'\n'"        healthUrl: ${ui}/health"
+            fi
+            cat <<EOF
+            - label: ${label}
+              composeFile: docker-compose.local.${label}.yml
+              containerName: cloud-${label}
+              components:
+                - name: ${ui_name}
+                  url: ${ui}${ui_health}
+                - name: ${api_name}
+                  url: ${api}/health
+                - name: Keycloak
+                  url: ${KEYCLOAK_URL}/realms/shop
+              externalSystems:
+                - name: ERP API
+                  url: ${erp}/health
+                - name: Clock API
+                  url: ${clock}/health
+          EOF
+          }
+          {
+            echo "systems:"
+            system_entry stub "$MYSHOP_UI_BASE_URL_STUB" "$MYSHOP_API_BASE_URL_STUB" "$ERP_API_BASE_URL_STUB" "$CLOCK_API_BASE_URL_STUB"
+            system_entry real "$MYSHOP_UI_BASE_URL_REAL" "$MYSHOP_API_BASE_URL_REAL" "$ERP_API_BASE_URL_REAL" "$CLOCK_API_BASE_URL_REAL"
+          } > "docker/systems.yaml"
+
+      # === Run Smoke Tests ===
+      - name: smoke-stub
+        run: gh optivem system-test run --suite smoke-stub
+      - name: smoke-real
+        run: gh optivem system-test run --suite smoke-real
+      # === Run Contract Tests ===
+      - name: contract-stub
+        run: gh optivem system-test run --suite contract-stub
+      - name: contract-stub-isolated
+        run: gh optivem system-test run --suite contract-stub-isolated
+      - name: contract-real
+        run: gh optivem system-test run --suite contract-real
+      # === Run Acceptance Tests ===
+      - name: acceptance-parallel-api
+        run: gh optivem system-test run --suite acceptance-parallel-api
+      - name: acceptance-parallel-ui
+        run: gh optivem system-test run --suite acceptance-parallel-ui
+      - name: acceptance-isolated-api
+        run: gh optivem system-test run --suite acceptance-isolated-api
+      - name: acceptance-isolated-ui
+        run: gh optivem system-test run --suite acceptance-isolated-ui
+      # === Run E2E Tests ===
+      - name: e2e-api
+        run: gh optivem system-test run --suite e2e-api
+      - name: e2e-ui
+        run: gh optivem system-test run --suite e2e-ui
+
+      # === Keep Evidence on Failure ===
+      # The stub server's journal + mappings, fetched from the deployed stub-stack external-systems
+      # service (WireMock, unauthenticated). Cloud Run container logs are not collected here: this
+      # job has no GCP credentials. Read them in Cloud Logging, or with `gcloud logging read
+      # 'resource.type="cloud_run_revision"' --project <project>`. Diagnostic only: never changes
+      # the job's verdict.
+      - name: Collect Failure Evidence
+        if: failure()
+        continue-on-error: true
+        uses: ./.github/actions/collect-failure-evidence
+        with:
+          artifact-name: failure-evidence-${{ env.PREFIX }}-${{ env.TEST_LANGUAGE }}-cloud
+          wiremock-url: ${{ env.EXTERNAL_BASE_URL_STUB }}
+
+      # === Tag Release Candidate ===
+      - name: Read Base System Version
+        id: read-version
+        uses: optivem/actions/read-base-version@v1
+        with:
+          file: ${{ env.VERSION_FILE }}
+
+      - name: Compose Prerelease Version
+        if: needs.check.outputs.on-main == 'true'
+        id: rc-version
+        uses: optivem/actions/compose-prerelease-version@v1
+        with:
+          base-version: ${{ steps.read-version.outputs.base-version }}
+          suffix: rc
+          build-number: ${{ github.run_number }}
+          prefix: ''
+
+      - name: Tag Docker Images for Prerelease
+        if: needs.check.outputs.on-main == 'true'
+        id: tag-images
+        uses: optivem/actions/tag-docker-images@v1
+        with:
+          image-urls: ${{ needs.check.outputs.image-digest-urls }}
+          tag: ${{ steps.rc-version.outputs.version }}
+          registry-username: ${{ github.repository_owner }}
+          token: ${{ secrets.GHCR_TOKEN }}
+
+  # === Publish Git Tag ===
+  publish-tag:
+    needs: [check, run]
+    if: needs.check.outputs.on-main == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.COMMIT_SHA }}
+
+      - name: Publish Git Tag
+        uses: optivem/actions/publish-tag@v1
+        with:
+          tag: ${{ needs.run.outputs.version }}
+          token: ${{ secrets.WORKFLOW_TOKEN }}
+
+  # === Verify RC Tag ===
+  # Moved here from _prerelease-pipeline.yml, now that this stage owns the RC: a main run
+  # must leave an rc tag on the tested SHA, whether this run created it or an earlier run of
+  # the same SHA did. A re-run re-tests the SHA and adds a higher rc tag; we resolve the
+  # highest, so that is harmless. Non-main runs never tag, so they are not checked.
+  verify-rc-tag:
+    needs: [check, run, publish-tag]
+    if: >-
+      ${{ always() && needs.check.result == 'success' && needs.check.outputs.on-main == 'true'
+          && !contains(fromJSON('["failure","cancelled"]'), needs.run.result)
+          && !contains(fromJSON('["failure","cancelled"]'), needs.publish-tag.result) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.get-version.outputs.tag }}
+    steps:
+      - id: get-version
+        uses: optivem/actions/resolve-latest-tag-from-sha@v1
+        with:
+          commit-sha: ${{ env.COMMIT_SHA }}
+          pattern: v${{ needs.check.outputs.base-version }}-rc.*
+
+      - name: Fail If No RC Tag On SHA
+        if: steps.get-version.outputs.tag == ''
+        shell: bash
+        env:
+          PATTERN: v${{ needs.check.outputs.base-version }}-rc.*
+          SHA: ${{ env.COMMIT_SHA }}
+        run: |
+          echo "::error::No rc tag matching '$PATTERN' found on $SHA — acceptance-stage produced no tag and none was pre-existing."
+          exit 1
+
+  # === Run Static Code Analysis ===
+  # Does not depend on the deploy target, so it runs here as on the Docker Compose gate.
+  sonar:
+    needs: run
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ env.COMMIT_SHA }}
+
+      - name: Setup Java
+        if: env.TEST_LANGUAGE == 'java'
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Setup Gradle
+        if: env.TEST_LANGUAGE == 'java'
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Pre-warm Gradle Wrapper (retry transient CDN flakes)
+        if: env.TEST_LANGUAGE == 'java'
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          command: cd system-test && ./gradlew --version
+
+      - name: Setup .NET
+        if: env.TEST_LANGUAGE == 'dotnet'
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Setup Node
+        if: env.TEST_LANGUAGE == 'typescript'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+          cache: 'npm'
+          cache-dependency-path: system-test/package-lock.json
+
+      # A SonarCloud outage (HTTP 5xx after every retry) skips analysis with a job-summary
+      # warning instead of failing the stage; any other failure still fails it. See
+      # .github/actions/sonar-scan.
+      - name: Run Sonar Analysis
+        uses: ./.github/actions/sonar-scan
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          label: Run Sonar Analysis
+          working-directory: system-test
+          command: bash ./run-sonar.sh
+
+  summary:
+    needs: [preflight, check, shared-images, deploy-keycloak, deploy-stack, run, publish-tag, verify-rc-tag, sonar]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+    - name: Summarize Stage
+      uses: optivem/actions/render-system-stage-summary@v1
+      with:
+        stage-name: 'Acceptance Stage (Cloud Run)'
+        stage-result: >-
+          ${{ (needs.preflight.result == 'failure' || needs.check.result == 'failure' || needs.shared-images.result == 'failure' || needs.deploy-keycloak.result == 'failure' || needs.deploy-stack.result == 'failure' || needs.run.result == 'failure' || needs.publish-tag.result == 'failure' || needs.verify-rc-tag.result == 'failure') && 'failure'
+              || (needs.preflight.result == 'cancelled' || needs.check.result == 'cancelled' || needs.shared-images.result == 'cancelled' || needs.deploy-keycloak.result == 'cancelled' || needs.deploy-stack.result == 'cancelled' || needs.run.result == 'cancelled' || needs.publish-tag.result == 'cancelled' || needs.verify-rc-tag.result == 'cancelled') && 'cancelled'
+              || needs.run.result }}
+        environment: acceptance
+        success-version: ${{ needs.check.outputs.on-main == 'true' && needs.run.outputs.version || 'not computed — non-main run' }}
+        success-artifact-ids: ${{ needs.run.outputs.image-urls }}
+        skipped-reason: ${{ needs.preflight.outputs.skip-reason || needs.check.outputs.skip-reason }}
+        latest-artifact-ids: ${{ needs.check.outputs.image-digest-urls }}
+        latest-updated-at: ${{ needs.check.outputs.latest-updated-at }}
+        last-run-at: ${{ needs.check.outputs.last-run-at }}

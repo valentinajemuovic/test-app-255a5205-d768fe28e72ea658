@@ -1,0 +1,41 @@
+name: acceptance-stage-docker-compose
+
+run-name: >-
+  acceptance-stage-docker-compose${{ inputs.commit-sha && format(' [sha:{0}]', inputs.commit-sha) || ' [latest-image]' }}
+
+# Docker Compose acceptance gate, latest suites. Runs on every prerelease pipeline run against
+# the commit-stage images on the runner. Gate only: it creates no RC tag (the cloud
+# acceptance-stage.yml does).
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # Run every hour
+  workflow_dispatch:
+    inputs:
+      commit-sha:
+        description: 'Git SHA to test (leave empty for latest image)'
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  # Scheduled runs share one group. Each dispatched run (a prerelease pipeline's gate) gets its own:
+  # in a shared group the next hourly run cancels a pending dispatched run, which fails the pipeline.
+  group: acceptance-stage-docker-compose-${{ github.event_name == 'schedule' && 'schedule' || github.run_id }}
+
+jobs:
+  acceptance-stage:
+    permissions:
+      actions: write
+      contents: read
+      packages: read
+    uses: ./.github/workflows/_acceptance-stage-docker-compose.yml
+    secrets: inherit
+    with:
+      architecture: multitier
+      language: typescript
+      test-language: typescript
+      images: '{"frontend":"test-app-255a5205-d768fe28e72ea658-frontend/frontend","backend":"test-app-255a5205-d768fe28e72ea658-backend/backend"}'
+      commit-sha: ${{ inputs.commit-sha }}
+      suite-set: latest

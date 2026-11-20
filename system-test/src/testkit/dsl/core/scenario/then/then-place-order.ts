@@ -1,0 +1,495 @@
+import type { OrderStatus } from '../../../../common/domain/OrderStatus.js';
+import { expect } from '@playwright/test';
+import type { SystemError } from '../../../../driver/port/dtos/errors/SystemError.js';
+import type { ViewOrderResponse } from '../../../../driver/port/dtos/ViewOrderResponse.js';
+import type { BrowseCouponItem } from '../../../../driver/port/dtos/BrowseCouponsResponse.js';
+import type { GetTimeResponse } from '../../../../driver/port/external/clock/dtos/GetTimeResponse.js';
+import { DEFAULTS } from '../defaults.js';
+import type { UseCaseContext } from '../../shared/use-case-context.js';
+import type { AppContext } from '../app-context.js';
+import type { ScenarioContext, ShippingAddressConfig } from '../scenario-context.js';
+import type { ShippingAddress } from '../../../../driver/port/dtos/ShippingAddress.js';
+import { arrangeGiven } from '../given/arrange-given.js';
+import { Converter } from '../../../../common/converter.js';
+import { ViewOrderVerification } from '../../usecase/usecases/ViewOrderVerification.js';
+
+export class ThenResultStage implements PromiseLike<void> {
+  private _expectSuccess = true;
+  private readonly _orderAssertions: ((order: ViewOrderResponse) => void)[] = [];
+  private readonly _couponAssertions: { code: string; fns: ((coupon: BrowseCouponItem) => void)[] }[] = [];
+  private readonly _clockAssertions: ((time: GetTimeResponse) => void)[] = [];
+  private readonly _errorAssertions: ((error: SystemError, useCaseContext: UseCaseContext, elapsedMs: number) => void)[] = [];
+  private _executionPromise: Promise<void> | null = null;
+
+  constructor(
+    private readonly app: AppContext,
+    private readonly ctx: ScenarioContext,
+    readonly useCaseContext: UseCaseContext,
+    private readonly sku: string | null,
+    private readonly quantity: string | null,
+    private readonly country: string | null = DEFAULTS.COUNTRY,
+    private readonly couponCode: string | null = null,
+    private readonly idempotencyKey: string | null = null,
+    private readonly shippingAddress: ShippingAddressConfig | null = null,
+  ) {}
+
+  shouldSucceed(): ThenSuccess {
+    this._expectSuccess = true;
+    return new ThenSuccess(this);
+  }
+
+  shouldFail(): ThenFailure {
+    this._expectSuccess = false;
+    return new ThenFailure(this);
+  }
+
+  _addOrderAssertion(fn: (order: ViewOrderResponse) => void): void {
+    this._orderAssertions.push(fn);
+  }
+
+  _addCouponAssertion(code: string, fn: (coupon: BrowseCouponItem) => void): void {
+    let entry = this._couponAssertions.find((e) => e.code === code);
+    if (!entry) {
+      entry = { code, fns: [] };
+      this._couponAssertions.push(entry);
+    }
+    entry.fns.push(fn);
+  }
+
+  _addClockAssertion(fn: (time: GetTimeResponse) => void): void {
+    this._clockAssertions.push(fn);
+  }
+
+  _addErrorAssertion(fn: (error: SystemError, useCaseContext: UseCaseContext, elapsedMs: number) => void): void {
+    this._errorAssertions.push(fn);
+  }
+
+  private async execute(): Promise<void> {
+    if (this._executionPromise) return this._executionPromise;
+    this._executionPromise = this._doExecute();
+    return this._executionPromise;
+  }
+
+  private async _runOrderAssertions(orderNumber: string): Promise<void> {
+    if (this._orderAssertions.length === 0) return;
+    const orderResult = await this.app.skyTravel().viewOrder({ orderNumber });
+    expect(orderResult.success).toBe(true);
+    if (orderResult.success) {
+      for (const fn of this._orderAssertions) fn(orderResult.value);
+    }
+  }
+
+  private async _runCouponAssertions(): Promise<void> {
+    for (const couponEntry of this._couponAssertions) {
+      const resolvedCouponCode = this.useCaseContext.getParamValue(couponEntry.code);
+      const browseResult = await this.app.skyTravel().browseCoupons({});
+      expect(browseResult.success).toBe(true);
+      if (!browseResult.success) continue;
+      const coupon = browseResult.value.coupons.find((c) => c.code === resolvedCouponCode);
+      expect(coupon, `Coupon '${resolvedCouponCode}' not found in browse results`).toBeDefined();
+      if (coupon) {
+        for (const fn of couponEntry.fns) fn(coupon);
+      }
+    }
+  }
+
+  private async _runClockAssertions(): Promise<void> {
+    if (this._clockAssertions.length === 0) return;
+    const timeResult = await this.app.clockDriver.getTime();
+    expect(timeResult.success).toBe(true);
+    if (timeResult.success) {
+      for (const fn of this._clockAssertions) fn(timeResult.value);
+    }
+  }
+
+  private async _doExecute(): Promise<void> {
+    await arrangeGiven(this.app, this.ctx, this.useCaseContext);
+
+    const resolvedSku = this.useCaseContext.getParamValue(this.sku);
+    const resolvedCouponCode = this.useCaseContext.getParamValue(this.couponCode);
+    // In address mode the tax country is the address's, so no top-level country is sent.
+    const shippingAddress = this.resolveShippingAddress();
+    const resolvedCountry = shippingAddress ? undefined : this.useCaseContext.getParamValueOrLiteral(this.country);
+
+    const startedAt = performance.now();
+    const result = await this.app.skyTravel('dynamic').placeOrder({
+      sku: resolvedSku,
+      quantity: this.quantity,
+      country: resolvedCountry,
+      shippingAddress,
+      couponCode: resolvedCouponCode,
+      // Keys are the shop's own data, so the alias always maps to a scenario-unique value.
+      idempotencyKey: this.useCaseContext.getParamValue(this.idempotencyKey),
+    });
+
+    const elapsedMs = performance.now() - startedAt;
+
+    if (this._expectSuccess) {
+      expect(result.success, JSON.stringify(result)).toBe(true);
+      if (!result.success) return;
+      await this._runOrderAssertions(result.value.orderNumber);
+      await this._runCouponAssertions();
+      await this._runClockAssertions();
+    } else {
+      expect(result.success, JSON.stringify(result)).toBe(false);
+      if (result.success) return;
+      for (const fn of this._errorAssertions) fn(result.error, this.useCaseContext, elapsedMs);
+    }
+  }
+
+  private resolveShippingAddress(): ShippingAddress | null {
+    if (!this.shippingAddress) return null;
+    return {
+      ...this.shippingAddress,
+      country: this.useCaseContext.getParamValueOrLiteral(this.shippingAddress.country) ?? this.shippingAddress.country,
+    };
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.execute().then(onfulfilled, onrejected);
+  }
+}
+
+export class ThenSuccess implements PromiseLike<void> {
+  constructor(private readonly stage: ThenResultStage) {}
+
+  and(): this {
+    return this;
+  }
+
+  order(): ThenOrder {
+    return new ThenOrder(this.stage);
+  }
+
+  coupon(code: string): ThenCoupon {
+    return new ThenCoupon(this.stage, code);
+  }
+
+  clock(): ThenClock {
+    return new ThenClock(this.stage);
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.stage.then(onfulfilled, onrejected);
+  }
+}
+
+export class ThenOrder implements PromiseLike<void> {
+  constructor(private readonly stage: ThenResultStage) {}
+
+  and(): this {
+    return this;
+  }
+
+  hasSku(expectedSku: string): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.sku).toBe(expectedSku);
+    });
+    return this;
+  }
+
+  hasQuantity(expectedQuantity: number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.quantity).toBe(expectedQuantity);
+    });
+    return this;
+  }
+
+  hasUnitPrice(expectedUnitPrice: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.unitPrice)).toBe(Converter.normalizeDecimal(expectedUnitPrice));
+    });
+    return this;
+  }
+
+  hasOrderNumberPrefix(prefix: string): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.orderNumber.startsWith(prefix)).toBe(true);
+    });
+    return this;
+  }
+
+  hasOrderNumber(orderNumber: string): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.orderNumber).toBe(this.stage.useCaseContext.getResultValue(orderNumber));
+    });
+    return this;
+  }
+
+  doesNotHaveOrderNumber(orderNumber: string): this {
+    this.stage._addOrderAssertion((order) => {
+      const other = this.stage.useCaseContext.getResultValue(orderNumber);
+      expect(order.orderNumber, `Expected order number to differ from '${other}'`).not.toBe(other);
+    });
+    return this;
+  }
+
+  hasStatus(status: OrderStatus): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.status).toBe(status);
+    });
+    return this;
+  }
+
+  hasTotalPrice(totalPrice: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.totalPrice)).toBe(Converter.normalizeDecimal(totalPrice));
+    });
+    return this;
+  }
+
+  hasTotalPriceGreaterThanZero(): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Number(order.totalPrice)).toBeGreaterThan(0);
+    });
+    return this;
+  }
+
+  hasSubtotalPrice(subtotalPrice: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.subtotalPrice)).toBe(Converter.normalizeDecimal(subtotalPrice));
+    });
+    return this;
+  }
+
+  hasTaxRate(taxRate: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.taxRate)).toBe(Converter.normalizeDecimal(taxRate));
+    });
+    return this;
+  }
+
+  hasTaxAmount(taxAmount: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.taxAmount)).toBe(Converter.normalizeDecimal(taxAmount));
+    });
+    return this;
+  }
+
+  hasDiscountRate(rate: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.discountRate)).toBe(Converter.normalizeDecimal(rate));
+    });
+    return this;
+  }
+
+  hasDiscountAmount(discountAmount: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.discountAmount)).toBe(Converter.normalizeDecimal(discountAmount));
+    });
+    return this;
+  }
+
+  hasAppliedCoupon(expectedCouponCode?: string | null): this {
+    this.stage._addOrderAssertion((order) => {
+      if (expectedCouponCode === undefined) {
+        expect(order.appliedCouponCode).toBeDefined();
+      } else {
+        const resolvedCode = this.stage.useCaseContext.getParamValue(expectedCouponCode);
+        expect(order.appliedCouponCode).toBe(resolvedCode);
+      }
+    });
+    return this;
+  }
+
+  hasBasePrice(basePrice: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.basePrice)).toBe(Converter.normalizeDecimal(basePrice));
+    });
+    return this;
+  }
+
+  hasCountry(expectedCountry: string): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.country).toBe(this.stage.useCaseContext.getParamValueOrLiteral(expectedCountry));
+    });
+    return this;
+  }
+
+  /** The country is an alias, resolved the same way as the one the order was placed with. */
+  hasShippingAddress(firstName: string, lastName: string, street: string, postalCode: string, city: string, country: string): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.shippingAddress, 'Order shipping address').toEqual({
+        firstName,
+        lastName,
+        street,
+        postalCode,
+        city,
+        country: this.stage.useCaseContext.getParamValueOrLiteral(country),
+      });
+    });
+    return this;
+  }
+
+  hasNoShippingAddress(): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.shippingAddress ?? null, 'Order shipping address').toBeNull();
+    });
+    return this;
+  }
+
+  /** The country as a code, such as "DE", not an alias: checkout offers only real shipping countries. */
+  hasCountryCode(expectedCountry: string): this {
+    this.stage._addOrderAssertion((order) => {
+      new ViewOrderVerification(order, this.stage.useCaseContext).countryCode(expectedCountry);
+    });
+    return this;
+  }
+
+  /** The shipping address, with its country as a code, not an alias. */
+  hasShippingAddressWithCountryCode(firstName: string, lastName: string, street: string, postalCode: string, city: string, country: string): this {
+    this.stage._addOrderAssertion((order) => {
+      new ViewOrderVerification(order, this.stage.useCaseContext).shippingAddressWithCountryCode({
+        firstName,
+        lastName,
+        street,
+        postalCode,
+        city,
+        country,
+      });
+    });
+    return this;
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.stage.then(onfulfilled, onrejected);
+  }
+}
+
+export class ThenClock implements PromiseLike<void> {
+  constructor(private readonly stage: ThenResultStage) {}
+
+  hasTime(time?: string): this {
+    this.stage._addClockAssertion((t) => {
+      if (time) {
+        expect(t.time).toContain(time);
+      } else {
+        expect(t.time).toBeTruthy();
+      }
+    });
+    return this;
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.stage.then(onfulfilled, onrejected);
+  }
+}
+
+export class ThenFailure implements PromiseLike<void> {
+  constructor(private readonly stage: ThenResultStage) {}
+
+  errorMessage(expected: string): this {
+    this.stage._addErrorAssertion((error, useCaseContext) => {
+      expect(error.message).toBe(useCaseContext.expandAliases(expected));
+    });
+    return this;
+  }
+
+  fieldErrorMessage(field: string, message: string): this {
+    this.stage._addErrorAssertion((error, useCaseContext) => {
+      const expandedMessage = useCaseContext.expandAliases(message);
+      const fieldError = error.fieldErrors.find((fe) => fe.field === field);
+      expect(fieldError?.message, `Expected field error for '${field}' in ${JSON.stringify(error.fieldErrors)}`).toBe(expandedMessage);
+    });
+    return this;
+  }
+
+  noOrderPersisted(): this {
+    this.stage._addErrorAssertion((error) => {
+      expect(error, 'Expected the rejected operation to yield an error response (nothing persisted)').toBeDefined();
+    });
+    return this;
+  }
+
+  serviceUnavailable(): this {
+    this.stage._addErrorAssertion((error) => {
+      expect(error.status, 'Expected HTTP status 503 (the UI channel has no HTTP status; run this on the API channel)').toBe(503);
+      expect(error.retryAfter, 'Expected a Retry-After header in whole seconds').toMatch(/^[1-9]\d*$/);
+      expect(error.contentType, 'Expected Content-Type application/problem+json').toMatch(/^application\/problem\+json/);
+    });
+    return this;
+  }
+
+  failedWithinSeconds(seconds: number): this {
+    this.stage._addErrorAssertion((_error, _useCaseContext, elapsedMs) => {
+      expect(elapsedMs, `Expected the call to fail within ${seconds}s, but it took ${Math.round(elapsedMs)}ms`).toBeLessThanOrEqual(seconds * 1000);
+    });
+    return this;
+  }
+
+  and(): this {
+    return this;
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.stage.then(onfulfilled, onrejected);
+  }
+}
+
+export class ThenCoupon implements PromiseLike<void> {
+  constructor(
+    private readonly stage: ThenResultStage,
+    private readonly code: string,
+  ) {}
+
+  and(): this {
+    return this;
+  }
+
+  hasDiscountRate(rate: string | number): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      expect(Converter.normalizeDecimalOrNull(coupon.discountRate)).toBe(Converter.normalizeDecimal(rate));
+    });
+    return this;
+  }
+
+  isValidFrom(validFrom: string): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      expect(coupon.validFrom ? new Date(coupon.validFrom).getTime() : coupon.validFrom, 'validFrom').toBe(new Date(validFrom).getTime());
+    });
+    return this;
+  }
+
+  isValidTo(validTo: string): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      expect(coupon.validTo ? new Date(coupon.validTo).getTime() : coupon.validTo, 'validTo').toBe(new Date(validTo).getTime());
+    });
+    return this;
+  }
+
+  hasUsageLimit(limit: number): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      expect(coupon.usageLimit).toBe(limit);
+    });
+    return this;
+  }
+
+  hasUsedCount(expectedUsedCount: number): this {
+    this.stage._addCouponAssertion(this.code, (coupon) => {
+      expect(coupon.usedCount).toBe(expectedUsedCount);
+    });
+    return this;
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.stage.then(onfulfilled, onrejected);
+  }
+}

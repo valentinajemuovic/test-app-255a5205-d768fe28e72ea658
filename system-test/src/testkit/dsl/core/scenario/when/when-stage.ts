@@ -1,0 +1,81 @@
+import type { UseCaseContext } from '../../shared/use-case-context.js';
+import type { AppContext } from '../app-context.js';
+import type { ScenarioContext } from '../scenario-context.js';
+import { WhenPlaceOrder } from './when-place-order.js';
+import { WhenCancelOrder } from './when-cancel-order.js';
+import { WhenDeliverOrder } from './when-deliver-order.js';
+import { WhenBrowseOrderHistory } from './when-browse-order-history.js';
+import { WhenBrowseCustomers } from './when-browse-customers.js';
+import { WhenViewOrder } from './when-view-order.js';
+import { WhenPublishCoupon } from './when-publish-coupon.js';
+import { WhenBrowseCoupons } from './when-browse-coupons.js';
+import { WhenViewProfile } from './when-view-profile.js';
+import { WhenUpdateProfile } from './when-update-profile.js';
+import { WhenBrowseCatalog } from './when-browse-catalog.js';
+import { WhenViewProduct } from './when-view-product.js';
+import { WhenManageCart } from './when-manage-cart.js';
+import { WhenCheckOut } from './when-check-out.js';
+
+export class WhenStage {
+  constructor(
+    private readonly app: AppContext,
+    private readonly ctx: ScenarioContext,
+    private readonly useCaseContext: UseCaseContext,
+  ) {}
+
+  placeOrder(): WhenPlaceOrder {
+    return new WhenPlaceOrder(this.app, this.ctx, this.useCaseContext);
+  }
+
+  cancelOrder(): WhenCancelOrder {
+    return new WhenCancelOrder(this.app, this.ctx, this.useCaseContext);
+  }
+
+  deliverOrder(): WhenDeliverOrder {
+    return new WhenDeliverOrder(this.app, this.ctx, this.useCaseContext);
+  }
+
+  browseOrderHistory(): WhenBrowseOrderHistory {
+    return new WhenBrowseOrderHistory(this.app, this.ctx, this.useCaseContext);
+  }
+
+  browseCustomers(): WhenBrowseCustomers {
+    return new WhenBrowseCustomers(this.app, this.ctx, this.useCaseContext);
+  }
+
+  viewOrder(): WhenViewOrder {
+    return new WhenViewOrder(this.app, this.ctx, this.useCaseContext);
+  }
+
+  publishCoupon(): WhenPublishCoupon {
+    return new WhenPublishCoupon(this.app, this.ctx, this.useCaseContext);
+  }
+
+  browseCoupons(): WhenBrowseCoupons {
+    return new WhenBrowseCoupons(this.app, this.ctx, this.useCaseContext);
+  }
+
+  viewProfile(): WhenViewProfile {
+    return new WhenViewProfile(this.app, this.ctx, this.useCaseContext);
+  }
+
+  updateProfile(): WhenUpdateProfile {
+    return new WhenUpdateProfile(this.app, this.ctx, this.useCaseContext);
+  }
+
+  browseCatalog(): WhenBrowseCatalog {
+    return new WhenBrowseCatalog(this.app, this.ctx, this.useCaseContext);
+  }
+
+  viewProduct(): WhenViewProduct {
+    return new WhenViewProduct(this.app, this.ctx, this.useCaseContext);
+  }
+
+  manageCart(): WhenManageCart {
+    return new WhenManageCart(this.app, this.ctx, this.useCaseContext);
+  }
+
+  checkOut(): WhenCheckOut {
+    return new WhenCheckOut(this.app, this.ctx, this.useCaseContext);
+  }
+}

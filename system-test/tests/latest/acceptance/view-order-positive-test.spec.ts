@@ -1,0 +1,137 @@
+import { test, forChannels, ChannelType } from './base/fixtures.js';
+import { OrderStatus } from '../../../src/testkit/common/dtos.js';
+import { criteria } from '../../commons/criteria.js';
+
+forChannels(ChannelType.UI, ChannelType.API)(() => {
+    test('shouldBeAbleToViewOrder', criteria('UC-002.4', 'UC-002.5'), async ({ scenario }) => {
+        await scenario
+            .given()
+            .product()
+            .withSku('BOOK-123')
+            .withUnitPrice(20)
+            .and()
+            .country()
+            .withCode('US')
+            .withTaxRate('0.10')
+            .and()
+            .coupon()
+            .withCouponCode('SUMMER2025')
+            .withDiscountRate(0.1)
+            .and()
+            .order()
+            .withSku('BOOK-123')
+            .withQuantity(5)
+            .withCountry('US')
+            .withCouponCode('SUMMER2025')
+            .when()
+            .viewOrder()
+            .then()
+            .shouldSucceed()
+            .and()
+            .order()
+            .hasOrderNumberPrefix('ORD-')
+            .hasSku('BOOK-123')
+            .hasQuantity(5)
+            .hasCountry('US')
+            .hasUnitPrice(20)
+            .hasAppliedCoupon('SUMMER2025')
+            .hasDiscountRate(0.1)
+            .hasTaxRate(0.1)
+            .hasStatus(OrderStatus.PLACED);
+    });
+
+    test('customerShouldBeAbleToViewOwnOrder', async ({ scenario }) => {
+        await scenario
+            .given()
+            .order()
+            .placedByCustomer()
+            .and()
+            .loggedInAsCustomer()
+            .when()
+            .viewOrder()
+            .then()
+            .shouldSucceed();
+    });
+
+    test('sameCustomerAliasShouldResolveToSameCustomer', async ({ scenario }) => {
+        await scenario
+            .given()
+            .order()
+            .placedByCustomer('B')
+            .and()
+            .loggedInAsCustomer('B')
+            .when()
+            .viewOrder()
+            .then()
+            .shouldSucceed();
+    });
+
+    test('adminShouldBeAbleToViewCustomerOrder', async ({ scenario }) => {
+        await scenario
+            .given()
+            .order()
+            .placedByCustomer()
+            .and()
+            .loggedInAsAdmin()
+            .when()
+            .viewOrder()
+            .then()
+            .shouldSucceed();
+    });
+
+    test('adminShouldBeAbleToViewAnotherCustomersOrder', criteria('UC-011.1'), async ({ scenario }) => {
+        await scenario
+            .given()
+            .order()
+            .placedByCustomer('B')
+            .and()
+            .loggedInAsAdmin()
+            .when()
+            .viewOrder()
+            .then()
+            .shouldSucceed();
+    });
+});
+
+test.eachAlsoFirstRow([{ status: OrderStatus.DELIVERED }, { status: OrderStatus.CANCELLED }])(
+    'shouldShowTheStatusOfTheOrder_$status',
+    criteria('UC-002.5'),
+    async ({ scenario, status }) => {
+        await scenario
+            .given()
+            .order()
+            .withStatus(status)
+            .when()
+            .viewOrder()
+            .then()
+            .shouldSucceed()
+            .and()
+            .order()
+            .hasStatus(status);
+    },
+);
+
+forChannels(ChannelType.UI, ChannelType.API)(() => {
+    test('shouldShowNoAppliedCouponWhenTheOrderUsedNone', criteria('UC-002.4'), async ({ scenario }) => {
+        await scenario.given().order().when().viewOrder().then().shouldSucceed().and().order().hasNoAppliedCoupon();
+    });
+});
+
+forChannels(ChannelType.UI)(() => {
+    test('shouldAskAnAnonymousVisitorToSignInAndReturnToTheOrderDetails', criteria('UC-002.11'), async ({ scenario }) => {
+        await scenario
+            .given()
+            .order()
+            .and()
+            .notLoggedIn()
+            .when()
+            .viewOrder()
+            .withSignInWhenAsked()
+            .then()
+            .shouldSucceed()
+            .and()
+            .order()
+            .hasOrderNumberPrefix('ORD-')
+            .hasStatus(OrderStatus.PLACED);
+    });
+});

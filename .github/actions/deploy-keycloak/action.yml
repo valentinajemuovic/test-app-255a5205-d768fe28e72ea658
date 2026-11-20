@@ -1,0 +1,346 @@
+name: 'Deploy Keycloak to Cloud Run'
+description: >-
+  Deploys the one Keycloak every variant and stage shares, and waits for all its realms.
+  Redeploys only when the image, a setting or the db credentials changed, so one workflow
+  doesn't restart Keycloak under another's tests. Passes SYSTEM and RUN_APP_SUFFIX, which the
+  image's realm files use as placeholders for the Cloud Run URLs (docker/keycloak/Dockerfile).
+  With keycloak-domain set, that domain becomes Keycloak's public hostname (token issuer, login
+  pages); the admin API calls below stay on run.app either way. Needs gcloud authenticated.
+
+inputs:
+  image:
+    description: 'Keycloak image reference'
+    required: true
+  system:
+    description: 'System name: prefixes the service, secrets and database'
+    required: true
+  project:
+    description: 'GCP project ID'
+    required: true
+  project-number:
+    description: 'GCP project number'
+    required: true
+  region:
+    description: 'GCP region'
+    required: true
+  keycloak-domain:
+    description: >-
+      Custom domain of this Keycloak (vars.KEYCLOAK_DOMAIN, e.g. shop-auth.example.com), mapped by
+      setup-custom-domains.sh. Set: KC_HOSTNAME becomes https://<domain>, so every realm issues tokens
+      with it. Empty (the default) keeps the run.app URL as the hostname, exactly as before.
+    required: false
+    default: ''
+  reconcile-prod-realm:
+    description: >-
+      'true' in the production stage: create or update the shop-prod realm's shop-monolith client
+      through the admin API and set its secret from Secret Manager, and turn on the realm's brute-force
+      detection. Needs the repo checked out.
+    required: false
+    default: 'false'
+  reconcile-system-test-admin:
+    description: >-
+      'true' in the acceptance stage: create or update the shop realm's shop-system-test-admin client
+      (docker/keycloak/system-test-admin-client.json) through the admin API, set its secret to
+      system-test-admin-secret, and give its service account exactly realm-management's manage-users,
+      view-users and query-users. The system tests use it to create fresh customers. Never touches
+      shop-qa or shop-prod. Needs the repo checked out.
+    required: false
+    default: 'false'
+  system-test-admin-secret:
+    description: >-
+      The shop-system-test-admin client secret (secrets.KEYCLOAK_TEST_ADMIN_CLIENT_SECRET); required
+      when reconcile-system-test-admin is 'true'. The system tests read the same secret.
+    required: false
+    default: ''
+  frontend-origins:
+    description: >-
+      Extra origins (space-separated, e.g. https://shop-acc.example.com) the frontend-realm's
+      shop-frontend client must accept: added to its redirect URIs, post-logout redirect URIs and web
+      origins through the admin API, because the realm file never reaches a realm that already exists.
+      Add-only and idempotent. Empty (the default) changes nothing.
+    required: false
+    default: ''
+  frontend-realm:
+    description: 'Realm whose shop-frontend client gets frontend-origins: shop (acceptance), shop-qa or shop-prod'
+    required: false
+    default: 'shop'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Deploy
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        SYSTEM: ${{ inputs.system }}
+        PROJECT: ${{ inputs.project }}
+        PROJECT_NUMBER: ${{ inputs.project-number }}
+        REGION: ${{ inputs.region }}
+        KEYCLOAK_DOMAIN: ${{ inputs.keycloak-domain }}
+      run: |
+        set -euo pipefail
+        url() { echo "https://$1-${PROJECT_NUMBER}.${REGION}.run.app"; }
+        # The public hostname (issuer, login and redirect URLs). KC_HOSTNAME_BACKCHANNEL_DYNAMIC (image)
+        # keeps run.app requests working, so the admin API steps below never depend on the mapping.
+        if [[ -n "$KEYCLOAK_DOMAIN" ]]; then
+          [[ "$KEYCLOAK_DOMAIN" =~ ^[a-z0-9.-]+$ ]] || { echo "::error::Not a domain: $KEYCLOAK_DOMAIN"; exit 1; }
+          hostname="https://${KEYCLOAK_DOMAIN}"
+        else
+          hostname="$(url "${SYSTEM}-keycloak")"
+        fi
+        db="$(gcloud secrets versions access latest --secret="${SYSTEM}-db")"
+        db_host="$(jq -r .host <<< "$db")"; db_port="$(jq -r .port <<< "$db")"
+        db_user="$(jq -r .user <<< "$db")"; db_password="$(jq -r .password <<< "$db")"
+        echo "::add-mask::${db_password}"
+        env_file="${RUNNER_TEMP}/keycloak-env.json"
+        jq -n \
+          --arg host "$hostname" \
+          --arg dburl "jdbc:postgresql://${db_host}:${db_port}/${SYSTEM//-/_}_keycloak?sslmode=require" \
+          --arg dbuser "$db_user" --arg dbpass "$db_password" \
+          --arg system "$SYSTEM" --arg suffix "${PROJECT_NUMBER}.${REGION}.run.app" \
+          '{KC_HOSTNAME:$host, KC_DB_URL:$dburl, KC_DB_USERNAME:$dbuser, KC_DB_PASSWORD:$dbpass,
+            KC_BOOTSTRAP_ADMIN_USERNAME:"admin", SYSTEM:$system, RUN_APP_SUFFIX:$suffix}' > "$env_file"
+        # One instance: Keycloak keeps in-flight logins in local memory and Cloud Run instances can't
+        # cluster, so a second instance makes login form posts fail with expired_code (UI tests hang).
+        args=(--image "$IMAGE" --region "$REGION" --project "$PROJECT"
+          --service-account "runtime@${PROJECT}.iam.gserviceaccount.com"
+          --port 8080 --memory 1Gi --cpu 1 --cpu-boost
+          --min-instances 0 --max-instances 1 --allow-unauthenticated
+          --set-secrets "KC_BOOTSTRAP_ADMIN_PASSWORD=${SYSTEM}-keycloak-admin-password:latest")
+        fingerprint="$(printf '%s\n' "${args[@]}" | cat - "$env_file" | sha256sum | cut -c1-32)"
+        deployed="$(gcloud run services describe "${SYSTEM}-keycloak" --region "$REGION" --project "$PROJECT" \
+          --format='value(metadata.labels.deploy_fingerprint)' 2> /dev/null || true)"
+        if [[ "$deployed" == "$fingerprint" ]]; then
+          echo "Keycloak is unchanged, not redeploying."
+        else
+          gcloud run deploy "${SYSTEM}-keycloak" "${args[@]}" \
+            --env-vars-file "$env_file" --labels "deploy_fingerprint=${fingerprint}"
+        fi
+        rm -f "$env_file"
+
+    - name: Wait for Keycloak (cold start + realm import)
+      uses: optivem/actions/wait-for-endpoints@v1
+      with:
+        endpoints: |
+          [
+            {"name": "Keycloak shop", "url": "https://${{ inputs.system }}-keycloak-${{ inputs.project-number }}.${{ inputs.region }}.run.app/realms/shop/.well-known/openid-configuration"},
+            {"name": "Keycloak shop-qa", "url": "https://${{ inputs.system }}-keycloak-${{ inputs.project-number }}.${{ inputs.region }}.run.app/realms/shop-qa/.well-known/openid-configuration"},
+            {"name": "Keycloak shop-prod", "url": "https://${{ inputs.system }}-keycloak-${{ inputs.project-number }}.${{ inputs.region }}.run.app/realms/shop-prod/.well-known/openid-configuration"}
+          ]
+        max-attempts: '60'
+        wait-seconds: '10'
+        timeout-seconds: '900'
+
+    # The mapping (setup-custom-domains.sh) routes to the service, so this proves TLS and the route
+    # before any backend is pointed at the domain.
+    - name: Wait for Keycloak custom domain
+      if: inputs.keycloak-domain != ''
+      uses: optivem/actions/wait-for-endpoints@v1
+      with:
+        endpoints: |
+          [
+            {"name": "Keycloak shop (${{ inputs.keycloak-domain }})", "url": "https://${{ inputs.keycloak-domain }}/realms/shop/.well-known/openid-configuration"}
+          ]
+        max-attempts: '30'
+        wait-seconds: '10'
+        timeout-seconds: '300'
+
+    # --import-realm skips realms that already exist, so a realm file change never reaches the live
+    # shop-prod. This step applies the shop-monolith client from the same filters the image uses
+    # (stage-realm.jq | prod-realm.jq) and sets its secret, which is never in git or in the image.
+    # Create-or-update only: it never deletes a client or a realm. PUT leaves protocol mappers as they are.
+    - name: Reconcile shop-prod monolith client
+      if: inputs.reconcile-prod-realm == 'true'
+      shell: bash
+      env:
+        SYSTEM: ${{ inputs.system }}
+        PROJECT_NUMBER: ${{ inputs.project-number }}
+        REGION: ${{ inputs.region }}
+      run: |
+        set -euo pipefail
+        suffix="${PROJECT_NUMBER}.${REGION}.run.app"
+        kc="https://${SYSTEM}-keycloak-${suffix}"
+        dir="${GITHUB_WORKSPACE}/docker/keycloak"
+        secret="$(gcloud secrets versions access latest --secret="${SYSTEM}-monolith-client-secret")"
+        echo "::add-mask::${secret}"
+        admin_password="$(gcloud secrets versions access latest --secret="${SYSTEM}-keycloak-admin-password")"
+        echo "::add-mask::${admin_password}"
+        token="$(curl -fsS "${kc}/realms/master/protocol/openid-connect/token" \
+          -d grant_type=password -d client_id=admin-cli -d username=admin \
+          --data-urlencode "password=${admin_password}" | jq -r .access_token)"
+        echo "::add-mask::${token}"
+        prod_realm="$(jq -L "$dir" --arg realm shop-prod --arg stage production --arg system "$SYSTEM" --arg suffix "$suffix" \
+            -f "${dir}/stage-realm.jq" "${dir}/shop-realm.json" \
+          | jq -f "${dir}/prod-realm.jq")"
+        client="$(jq -c --arg secret "$secret" '.clients[] | select(.clientId == "shop-monolith") | .secret = $secret' <<< "$prod_realm")"
+        [[ -n "$client" ]] || { echo "::error::shop-monolith is missing from the production realm filters"; exit 1; }
+        api="${kc}/admin/realms/shop-prod/clients"
+        auth=(-H "Authorization: Bearer ${token}" -H "Content-Type: application/json")
+        lookup() { curl -fsS "${auth[@]}" "${api}?clientId=shop-monolith" | jq -r '.[0].id // empty'; }
+        id="$(lookup)"
+        if [[ -z "$id" ]]; then
+          # Every prod-stage variant shares this realm and meta-release promotes them in parallel, so
+          # another variant can create the client between the lookup and the POST (409, meta-release
+          # 42260249107): then fall through to updating the client it created.
+          code="$(curl -sS -o /dev/null -w '%{http_code}' "${auth[@]}" -X POST "$api" -d "$client")"
+          case "$code" in
+            201) echo "Created shop-monolith in shop-prod." ;;
+            409) id="$(lookup)"; [[ -n "$id" ]] || { echo "::error::POST returned 409 but shop-monolith is not in shop-prod"; exit 1; } ;;
+            *) echo "::error::Creating shop-monolith in shop-prod returned HTTP ${code}"; exit 1 ;;
+          esac
+        fi
+        if [[ -n "$id" ]]; then
+          # The parallel variants also PUT this client at the same moment, and Keycloak answers a
+          # concurrent update with 409 (meta-release 43514773710). The PUT is idempotent: retry it.
+          body="$(mktemp)"
+          for attempt in 1 2 3 4 5; do
+            code="$(curl -sS -o "$body" -w '%{http_code}' "${auth[@]}" -X PUT "${api}/${id}" -d "$(jq -c --arg id "$id" '.id = $id' <<< "$client")")"
+            [[ "$code" == 409 && "$attempt" -lt 5 ]] || break
+            echo "PUT shop-monolith returned 409 (concurrent update); retrying (${attempt}/5)."
+            sleep $((attempt * 2 + RANDOM % 3))
+          done
+          [[ "$code" == 2* ]] || { echo "::error::Updating shop-monolith in shop-prod returned HTTP ${code}: $(head -c 2000 "$body")"; exit 1; }
+          echo "Updated shop-monolith in shop-prod."
+        fi
+        # Brute-force detection (B-PRG 4.2), production realm only (prod-realm.jq): the import never updates an
+        # existing realm, so set it here too. A partial realm PUT changes only the fields it carries.
+        # Parallel variants run this too: retry on 409.
+        brute_force="$(jq -c '{bruteForceProtected, permanentLockout, failureFactor, waitIncrementSeconds,
+            maxFailureWaitSeconds, maxDeltaTimeSeconds, quickLoginCheckMilliSeconds, minimumQuickLoginWaitSeconds}' <<< "$prod_realm")"
+        realm_body="$(mktemp)"
+        for attempt in 1 2 3 4 5; do
+          code="$(curl -sS -o "$realm_body" -w '%{http_code}' "${auth[@]}" -X PUT "${kc}/admin/realms/shop-prod" -d "$brute_force")"
+          [[ "$code" == 409 && "$attempt" -lt 5 ]] || break
+          echo "PUT shop-prod realm returned 409 (concurrent update); retrying (${attempt}/5)."
+          sleep $((attempt * 2 + RANDOM % 3))
+        done
+        [[ "$code" == 2* ]] || { echo "::error::Setting brute-force detection on shop-prod returned HTTP ${code}: $(head -c 2000 "$realm_body")"; exit 1; }
+        echo "Brute-force detection on in shop-prod."
+
+    # The acceptance stage's system tests create a fresh customer per test. On a shared Keycloak they
+    # sign in as this client's service account (client credentials in realm shop), never as the master
+    # admin, so a leaked secret can only manage users of the test realm. The realm file never reaches a
+    # realm that already exists, so the client lives here. Create-or-update: it never deletes a client,
+    # and it converges the service account's realm-management roles to exactly the three user roles.
+    - name: Reconcile system-test admin client (shop realm)
+      if: inputs.reconcile-system-test-admin == 'true'
+      shell: bash
+      env:
+        SYSTEM: ${{ inputs.system }}
+        PROJECT_NUMBER: ${{ inputs.project-number }}
+        REGION: ${{ inputs.region }}
+        CLIENT_SECRET: ${{ inputs.system-test-admin-secret }}
+      run: |
+        set -euo pipefail
+        realm=shop
+        client_id=shop-system-test-admin
+        wanted='["manage-users","query-users","view-users"]'
+        if [[ -z "$CLIENT_SECRET" ]]; then
+          echo "::error::The ${client_id} client needs a secret: set the KEYCLOAK_TEST_ADMIN_CLIENT_SECRET GitHub secret (e.g. gh secret set KEYCLOAK_TEST_ADMIN_CLIENT_SECRET --body \"\$(openssl rand -base64 32 | tr -d '\\n')\"). The system tests create customers with it."
+          exit 1
+        fi
+        echo "::add-mask::${CLIENT_SECRET}"
+        kc="https://${SYSTEM}-keycloak-${PROJECT_NUMBER}.${REGION}.run.app"
+        admin_password="$(gcloud secrets versions access latest --secret="${SYSTEM}-keycloak-admin-password")"
+        echo "::add-mask::${admin_password}"
+        token="$(curl -fsS "${kc}/realms/master/protocol/openid-connect/token" \
+          -d grant_type=password -d client_id=admin-cli -d username=admin \
+          --data-urlencode "password=${admin_password}" | jq -r .access_token)"
+        echo "::add-mask::${token}"
+        client="$(jq -c --arg secret "$CLIENT_SECRET" '.secret = $secret' "${GITHUB_WORKSPACE}/docker/keycloak/system-test-admin-client.json")"
+        [[ "$(jq -r .clientId <<< "$client")" == "$client_id" ]] || { echo "::error::system-test-admin-client.json must define ${client_id}"; exit 1; }
+        # Keycloak stores name and description in VARCHAR(255) columns; a longer value fails the POST with a bare HTTP 500.
+        too_long="$(jq -r '[to_entries[] | select((.key == "name" or .key == "description") and (.value | length) > 255) | .key] | join(", ")' <<< "$client")"
+        [[ -z "$too_long" ]] || { echo "::error::system-test-admin-client.json: ${too_long} is longer than Keycloak's 255-character limit"; exit 1; }
+        admin="${kc}/admin/realms/${realm}"
+        api="${admin}/clients"
+        auth=(-H "Authorization: Bearer ${token}" -H "Content-Type: application/json")
+        lookup() { curl -fsS "${auth[@]}" "${api}?clientId=$1" | jq -r '.[0].id // empty'; }
+        id="$(lookup "$client_id")"
+        if [[ -z "$id" ]]; then
+          # Every acceptance variant shares this realm, so another variant can create the client between
+          # the lookup and the POST (409): then fall through to updating the client it created.
+          body="$(mktemp)"
+          code="$(curl -sS -o "$body" -w '%{http_code}' "${auth[@]}" -X POST "$api" -d "$client")"
+          case "$code" in
+            201) echo "Created ${client_id} in ${realm}." ;;
+            409) ;;
+            *) echo "::error::Creating ${client_id} in ${realm} returned HTTP ${code}: $(head -c 2000 "$body")"; exit 1 ;;
+          esac
+          id="$(lookup "$client_id")"
+          [[ -n "$id" ]] || { echo "::error::${client_id} is still missing from realm ${realm}"; exit 1; }
+        fi
+        # PUT also resets the secret, so a rotated GitHub secret takes effect on the next run.
+        # The parallel acceptance variants PUT this client at the same moment; Keycloak answers a
+        # concurrent update with 409. The PUT is idempotent: retry it.
+        body="$(mktemp)"
+        for attempt in 1 2 3 4 5; do
+          code="$(curl -sS -o "$body" -w '%{http_code}' "${auth[@]}" -X PUT "${api}/${id}" -d "$(jq -c --arg id "$id" '.id = $id' <<< "$client")")"
+          [[ "$code" == 409 && "$attempt" -lt 5 ]] || break
+          echo "PUT ${client_id} returned 409 (concurrent update); retrying (${attempt}/5)."
+          sleep $((attempt * 2 + RANDOM % 3))
+        done
+        [[ "$code" == 2* ]] || { echo "::error::Updating ${client_id} in ${realm} returned HTTP ${code}: $(head -c 2000 "$body")"; exit 1; }
+        echo "Updated ${client_id} in ${realm}."
+        sa="$(curl -fsS "${auth[@]}" "${api}/${id}/service-account-user" | jq -r '.id // empty')"
+        [[ -n "$sa" ]] || { echo "::error::${client_id} in ${realm} has no service-account user"; exit 1; }
+        rm_id="$(lookup realm-management)"
+        [[ -n "$rm_id" ]] || { echo "::error::realm ${realm} has no realm-management client"; exit 1; }
+        roles="$(curl -fsS "${auth[@]}" "${api}/${rm_id}/roles" \
+          | jq -c --argjson wanted "$wanted" '[.[] | select(.name as $n | $wanted | index($n))]')"
+        [[ "$(jq -c '[.[].name] | sort' <<< "$roles")" == "$wanted" ]] \
+          || { echo "::error::realm-management in ${realm} lacks one of ${wanted}: found $(jq -c '[.[].name]' <<< "$roles")"; exit 1; }
+        mappings="${admin}/users/${sa}/role-mappings/clients/${rm_id}"
+        curl -fsS "${auth[@]}" -X POST "$mappings" -d "$roles" > /dev/null
+        # Least privilege: drop any other realm-management role (e.g. one added by hand).
+        extra="$(curl -fsS "${auth[@]}" "$mappings" | jq -c --argjson wanted "$wanted" '[.[] | select(.name as $n | $wanted | index($n) | not)]')"
+        if [[ "$extra" != "[]" ]]; then
+          curl -fsS "${auth[@]}" -X DELETE "$mappings" -d "$extra" > /dev/null
+          echo "Removed extra realm-management roles from ${client_id}: $(jq -c '[.[].name]' <<< "$extra")"
+        fi
+        echo "${client_id} (${realm}) holds realm-management: ${wanted}"
+
+    # The custom domains of the permanent environments (docs/environments.md).
+    # Add-only: never removes a URI, so other variants' run.app URLs stay as the realm file made them.
+    - name: Allow custom-domain origins on shop-frontend
+      if: inputs.frontend-origins != ''
+      shell: bash
+      env:
+        SYSTEM: ${{ inputs.system }}
+        PROJECT_NUMBER: ${{ inputs.project-number }}
+        REGION: ${{ inputs.region }}
+        ORIGINS: ${{ inputs.frontend-origins }}
+        REALM: ${{ inputs.frontend-realm }}
+      run: |
+        set -euo pipefail
+        # shellcheck disable=SC2086 # ORIGINS is a space-separated list
+        origins="$(printf '%s\n' $ORIGINS | jq -R . | jq -sc 'map(select(. != "") | sub("/+$"; ""))')"
+        for o in $(jq -r '.[]' <<< "$origins"); do
+          [[ "$o" =~ ^https://[a-z0-9.-]+$ ]] || { echo "::error::Not an https origin: $o"; exit 1; }
+        done
+        [[ "$origins" != "[]" ]] || { echo "No frontend origins to add."; exit 0; }
+        kc="https://${SYSTEM}-keycloak-${PROJECT_NUMBER}.${REGION}.run.app"
+        admin_password="$(gcloud secrets versions access latest --secret="${SYSTEM}-keycloak-admin-password")"
+        echo "::add-mask::${admin_password}"
+        token="$(curl -fsS "${kc}/realms/master/protocol/openid-connect/token" \
+          -d grant_type=password -d client_id=admin-cli -d username=admin \
+          --data-urlencode "password=${admin_password}" | jq -r .access_token)"
+        echo "::add-mask::${token}"
+        [[ "$REALM" =~ ^shop(-qa|-prod)?$ ]] || { echo "::error::Unknown realm: $REALM"; exit 1; }
+        api="${kc}/admin/realms/${REALM}/clients"
+        auth=(-H "Authorization: Bearer ${token}" -H "Content-Type: application/json")
+        client="$(curl -fsS "${auth[@]}" "${api}?clientId=shop-frontend" | jq -c '.[0] // empty')"
+        [[ -n "$client" ]] || { echo "::error::shop-frontend is missing from the ${REALM} realm"; exit 1; }
+        updated="$(jq -c --argjson o "$origins" '
+          ($o | map(. + "/*")) as $patterns
+          | .redirectUris = ((.redirectUris // []) + ($patterns - (.redirectUris // [])))
+          | .webOrigins = ((.webOrigins // []) + ($o - (.webOrigins // [])))
+          | .attributes["post.logout.redirect.uris"] |= (
+              ((. // "") | split("##") | map(select(. != ""))) as $have
+              | $have + ($patterns - $have) | join("##"))' <<< "$client")"
+        if [[ "$(jq -S . <<< "$updated")" == "$(jq -S . <<< "$client")" ]]; then
+          echo "shop-frontend (${REALM}) already accepts: ${ORIGINS}"
+        else
+          curl -fsS "${auth[@]}" -X PUT "${api}/$(jq -r .id <<< "$client")" -d "$updated" > /dev/null
+          echo "shop-frontend (${REALM}) now accepts: ${ORIGINS}"
+        fi

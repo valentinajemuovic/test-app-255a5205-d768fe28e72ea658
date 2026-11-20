@@ -1,0 +1,308 @@
+import type { OrderStatus } from '../../../../common/domain/OrderStatus.js';
+import { expect } from '@playwright/test';
+import type { SystemError } from '../../../../driver/port/dtos/errors/SystemError.js';
+import type { ViewOrderResponse } from '../../../../driver/port/dtos/ViewOrderResponse.js';
+import type { UseCaseContext } from '../../shared/use-case-context.js';
+import type { AppContext } from '../app-context.js';
+import type { ScenarioContext } from '../scenario-context.js';
+import { arrangeGiven } from '../given/arrange-given.js';
+import { Converter } from '../../../../common/converter.js';
+
+export class ThenViewOrderResultStage implements PromiseLike<void> {
+  private _expectSuccess = true;
+  private readonly _orderAssertions: ((order: ViewOrderResponse) => void)[] = [];
+  private readonly _errorAssertions: ((error: SystemError, useCaseContext: UseCaseContext) => void)[] = [];
+  private _executionPromise: Promise<void> | null = null;
+
+  constructor(
+    private readonly app: AppContext,
+    private readonly ctx: ScenarioContext,
+    readonly useCaseContext: UseCaseContext,
+    private readonly orderNumber: string,
+    private readonly whenAskedToSignIn: string | null = null,
+  ) {}
+
+  shouldSucceed(): ThenViewOrderSuccess {
+    this._expectSuccess = true;
+    return new ThenViewOrderSuccess(this);
+  }
+
+  shouldFail(): ThenViewOrderFailure {
+    this._expectSuccess = false;
+    return new ThenViewOrderFailure(this);
+  }
+
+  _addOrderAssertion(fn: (order: ViewOrderResponse) => void): void {
+    this._orderAssertions.push(fn);
+  }
+
+  _addErrorAssertion(fn: (error: SystemError, useCaseContext: UseCaseContext) => void): void {
+    this._errorAssertions.push(fn);
+  }
+
+  private async execute(): Promise<void> {
+    if (this._executionPromise) return this._executionPromise;
+    this._executionPromise = this._doExecute();
+    return this._executionPromise;
+  }
+
+  private async _doExecute(): Promise<void> {
+    await arrangeGiven(this.app, this.ctx, this.useCaseContext);
+
+    const targetOrderNumber = this.ctx.orderConfigs[0]?.orderNumber ?? this.orderNumber;
+
+    const result = await this.app.skyTravel('dynamic').viewOrder({
+      orderNumber: targetOrderNumber,
+      whenAskedToSignIn: this.whenAskedToSignIn,
+    });
+
+    if (this._expectSuccess) {
+      expect(result.success, JSON.stringify(result)).toBe(true);
+      if (result.success) {
+        for (const fn of this._orderAssertions) fn(result.value);
+      }
+    } else {
+      expect(result.success, JSON.stringify(result)).toBe(false);
+      if (!result.success) {
+        for (const fn of this._errorAssertions) fn(result.error, this.useCaseContext);
+      }
+    }
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.execute().then(onfulfilled, onrejected);
+  }
+}
+
+export class ThenViewOrderSuccess implements PromiseLike<void> {
+  constructor(private readonly stage: ThenViewOrderResultStage) {}
+
+  and(): this {
+    return this;
+  }
+
+  order(): ThenViewOrderOrder {
+    return new ThenViewOrderOrder(this.stage);
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.stage.then(onfulfilled, onrejected);
+  }
+}
+
+export class ThenViewOrderOrder implements PromiseLike<void> {
+  constructor(private readonly stage: ThenViewOrderResultStage) {}
+
+  hasSku(expectedSku: string): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.sku).toBe(this.stage.useCaseContext.getParamValue(expectedSku));
+    });
+    return this;
+  }
+
+  hasQuantity(expectedQuantity: number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.quantity).toBe(expectedQuantity);
+    });
+    return this;
+  }
+
+  hasCountry(expectedCountry: string): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.country).toBe(this.stage.useCaseContext.getParamValueOrLiteral(expectedCountry));
+    });
+    return this;
+  }
+
+  hasUnitPrice(expectedUnitPrice: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.unitPrice)).toBe(Converter.normalizeDecimal(expectedUnitPrice));
+    });
+    return this;
+  }
+
+  hasBasePrice(basePrice: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.basePrice)).toBe(Converter.normalizeDecimal(basePrice));
+    });
+    return this;
+  }
+
+  hasDiscountRate(discountRate: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.discountRate)).toBe(Converter.normalizeDecimal(discountRate));
+    });
+    return this;
+  }
+
+  hasDiscountAmount(discountAmount: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.discountAmount)).toBe(Converter.normalizeDecimal(discountAmount));
+    });
+    return this;
+  }
+
+  hasSubtotalPrice(subtotalPrice: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.subtotalPrice)).toBe(Converter.normalizeDecimal(subtotalPrice));
+    });
+    return this;
+  }
+
+  hasTaxRate(taxRate: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.taxRate)).toBe(Converter.normalizeDecimal(taxRate));
+    });
+    return this;
+  }
+
+  hasTaxAmount(taxAmount: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.taxAmount)).toBe(Converter.normalizeDecimal(taxAmount));
+    });
+    return this;
+  }
+
+  hasTotalPrice(totalPrice: string | number): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(Converter.normalizeDecimalOrNull(order.totalPrice)).toBe(Converter.normalizeDecimal(totalPrice));
+    });
+    return this;
+  }
+
+  /** The order used no coupon: the UI shows "None". */
+  hasNoAppliedCoupon(): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.appliedCouponCode ?? null, 'Applied coupon code (none)').toBeNull();
+    });
+    return this;
+  }
+
+  /** The order details offer Cancel Order (UI only). */
+  offersCancelOrder(): this {
+    return this.cancelOffered(true);
+  }
+
+  /** The order details do not offer Cancel Order (UI only). */
+  doesNotOfferCancelOrder(): this {
+    return this.cancelOffered(false);
+  }
+
+  /** The order details offer Deliver Order (UI only). */
+  offersDeliverOrder(): this {
+    return this.deliverOffered(true);
+  }
+
+  /** The order details do not offer Deliver Order (UI only). */
+  doesNotOfferDeliverOrder(): this {
+    return this.deliverOffered(false);
+  }
+
+  private cancelOffered(expected: boolean): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.cancelOffered, 'Cancel Order offered (UI only)').toBe(expected);
+    });
+    return this;
+  }
+
+  private deliverOffered(expected: boolean): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.deliverOffered, 'Deliver Order offered (UI only)').toBe(expected);
+    });
+    return this;
+  }
+
+  hasAppliedCoupon(expectedCouponCode: string): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.appliedCouponCode).toBe(this.stage.useCaseContext.getParamValue(expectedCouponCode));
+    });
+    return this;
+  }
+
+  hasStatus(status: OrderStatus): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.status).toBe(status);
+    });
+    return this;
+  }
+
+  hasOrderNumberPrefix(prefix: string): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.orderNumber.startsWith(prefix)).toBe(true);
+    });
+    return this;
+  }
+
+  /** The country is an alias, resolved the same way as hasCountry. */
+  hasShippingAddress(firstName: string, lastName: string, street: string, postalCode: string, city: string, country: string): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.shippingAddress, 'Order shipping address').toEqual({
+        firstName,
+        lastName,
+        street,
+        postalCode,
+        city,
+        country: this.stage.useCaseContext.getParamValueOrLiteral(country),
+      });
+    });
+    return this;
+  }
+
+  hasNoShippingAddress(): this {
+    this.stage._addOrderAssertion((order) => {
+      expect(order.shippingAddress ?? null, 'Order shipping address').toBeNull();
+    });
+    return this;
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.stage.then(onfulfilled, onrejected);
+  }
+}
+
+export class ThenViewOrderFailure implements PromiseLike<void> {
+  constructor(private readonly stage: ThenViewOrderResultStage) {}
+
+  and(): this {
+    return this;
+  }
+
+  errorMessage(expected: string): this {
+    this.stage._addErrorAssertion((error, useCaseContext) => {
+      expect(error.message).toBe(useCaseContext.expandAliases(expected));
+    });
+    return this;
+  }
+
+  noOrderPersisted(): this {
+    this.stage._addErrorAssertion((error) => {
+      expect(error, 'Expected the rejected operation to yield an error response (nothing persisted)').toBeDefined();
+    });
+    return this;
+  }
+
+  fieldErrorMessage(field: string, message: string): this {
+    this.stage._addErrorAssertion((error, useCaseContext) => {
+      const expandedMessage = useCaseContext.expandAliases(message);
+      const fieldError = error.fieldErrors.find((fe) => fe.field === field);
+      expect(fieldError?.message, `Expected field error for '${field}' in ${JSON.stringify(error.fieldErrors)}`).toBe(expandedMessage);
+    });
+    return this;
+  }
+
+  then<TResult1 = void, TResult2 = never>(
+    onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.stage.then(onfulfilled, onrejected);
+  }
+}

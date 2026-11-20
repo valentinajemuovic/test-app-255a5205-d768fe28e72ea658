@@ -1,0 +1,20 @@
+{
+  "request": {
+    "method": "GET",
+    "url": "/erp/api/products/LENOVO-T14"
+  },
+  "response": {
+    "status": 200,
+    "jsonBody": {
+      "id": "LENOVO-T14",
+      "title": "Lenovo ThinkPad T14",
+      "description": "14-inch business laptop",
+      "price": 999.99,
+      "category": "Laptops",
+      "brand": "Lenovo"
+    },
+    "headers": {
+      "Content-Type": "application/json"
+    }
+  }
+}

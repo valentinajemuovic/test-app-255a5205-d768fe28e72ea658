@@ -1,0 +1,46 @@
+name: prod-stage
+
+# Production stage: deploys the latest QA-approved release candidate to production on Cloud Run
+# and publishes the release, then bumps the patch versions. To deploy with Docker Compose
+# instead, see the commented block in _prod-stage.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Prerelease version to deploy (e.g., v1.0.0-rc.1). Leave empty to deploy the latest QA-approved RC.'
+        required: false
+        type: string
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: prod-stage
+
+jobs:
+  prod-stage:
+    permissions:
+      actions: write
+      contents: write
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/_prod-stage.yml
+    secrets: inherit
+    with:
+      architecture: multitier
+      language: typescript
+      test-language: typescript
+      images: '{"frontend":"test-app-255a5205-d768fe28e72ea658-frontend/frontend","backend":"test-app-255a5205-d768fe28e72ea658-backend/backend"}'
+      version: ${{ inputs.version }}
+      # setup-custom-domains.sh sets this once the domain mapping is ready.
+      domain: ${{ vars.PROD_DOMAIN }}
+
+  # Lives here, not in _prod-stage.yml, because a `uses:` path cannot be built from inputs.
+  bump-patch-version:
+    needs: prod-stage
+    if: ${{ !failure() && !cancelled() && needs.prod-stage.result == 'success' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/bump-patch-version.yml
+    secrets: inherit

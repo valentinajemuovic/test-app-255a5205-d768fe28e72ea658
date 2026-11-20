@@ -1,0 +1,58 @@
+import type { Result } from '../../common/result.js';
+import type { ActingUserSelector } from './acting-user-selector.js';
+import type { AsyncCloseable } from './async-closeable.js';
+import type { GoToSkyTravelRequest } from './dtos/GoToSkyTravelRequest.js';
+import type { GoToSkyTravelResponse } from './dtos/GoToSkyTravelResponse.js';
+import type { PlaceOrderRequest } from './dtos/PlaceOrderRequest.js';
+import type { PlaceOrderResponse } from './dtos/PlaceOrderResponse.js';
+import type { CancelOrderRequest } from './dtos/CancelOrderRequest.js';
+import type { CancelOrderResponse } from './dtos/CancelOrderResponse.js';
+import type { DeliverOrderRequest } from './dtos/DeliverOrderRequest.js';
+import type { DeliverOrderResponse } from './dtos/DeliverOrderResponse.js';
+import type { ViewOrderRequest } from './dtos/ViewOrderRequest.js';
+import type { ViewOrderResponse } from './dtos/ViewOrderResponse.js';
+import type { SystemError } from './dtos/errors/SystemError.js';
+import type { BrowseOrderHistoryRequest } from './dtos/BrowseOrderHistoryRequest.js';
+import type { BrowseOrderHistoryResponse } from './dtos/BrowseOrderHistoryResponse.js';
+import type { PublishCouponRequest } from './dtos/PublishCouponRequest.js';
+import type { PublishCouponResponse } from './dtos/PublishCouponResponse.js';
+import type { BrowseCouponsRequest } from './dtos/BrowseCouponsRequest.js';
+import type { BrowseCouponsResponse } from './dtos/BrowseCouponsResponse.js';
+import type { BrowseCustomersRequest } from './dtos/BrowseCustomersRequest.js';
+import type { BrowseCustomersResponse } from './dtos/BrowseCustomersResponse.js';
+import type { ViewProfileRequest } from './dtos/ViewProfileRequest.js';
+import type { ViewProfileResponse } from './dtos/ViewProfileResponse.js';
+import type { UpdateProfileRequest } from './dtos/UpdateProfileRequest.js';
+import type { BrowseCatalogRequest } from './dtos/BrowseCatalogRequest.js';
+import type { BrowseCatalogResponse } from './dtos/BrowseCatalogResponse.js';
+import type { ViewProductRequest } from './dtos/ViewProductRequest.js';
+import type { ViewProductResponse } from './dtos/ViewProductResponse.js';
+import type { ManageCartRequest } from './dtos/ManageCartRequest.js';
+import type { ManageCartResponse } from './dtos/ManageCartResponse.js';
+import type { CheckOutRequest } from './dtos/CheckOutRequest.js';
+import type { CheckOutResponse } from './dtos/CheckOutResponse.js';
+import type { CheckAccessibilityRequest } from './dtos/CheckAccessibilityRequest.js';
+import type { CheckAccessibilityResponse } from './dtos/CheckAccessibilityResponse.js';
+
+export interface SkyTravelDriver extends AsyncCloseable, ActingUserSelector {
+  goToSkyTravel(request: GoToSkyTravelRequest): Promise<Result<GoToSkyTravelResponse, SystemError>>;
+  placeOrder(request: PlaceOrderRequest): Promise<Result<PlaceOrderResponse, SystemError>>;
+  cancelOrder(request: CancelOrderRequest): Promise<Result<CancelOrderResponse, SystemError>>;
+  deliverOrder(request: DeliverOrderRequest): Promise<Result<DeliverOrderResponse, SystemError>>;
+  viewOrder(request: ViewOrderRequest): Promise<Result<ViewOrderResponse, SystemError>>;
+  browseOrderHistory(request: BrowseOrderHistoryRequest): Promise<Result<BrowseOrderHistoryResponse, SystemError>>;
+  /** The customers who have placed orders (admin only); the UI offers them only inside the order history. */
+  browseCustomers(request: BrowseCustomersRequest): Promise<Result<BrowseCustomersResponse, SystemError>>;
+  publishCoupon(request: PublishCouponRequest): Promise<Result<PublishCouponResponse, SystemError>>;
+  browseCoupons(request: BrowseCouponsRequest): Promise<Result<BrowseCouponsResponse, SystemError>>;
+  viewProfile(request: ViewProfileRequest): Promise<Result<ViewProfileResponse, SystemError>>;
+  /** Saves the profile; the response is the saved profile, the same shape viewProfile returns. */
+  updateProfile(request: UpdateProfileRequest): Promise<Result<ViewProfileResponse, SystemError>>;
+  browseCatalog(request: BrowseCatalogRequest): Promise<Result<BrowseCatalogResponse, SystemError>>;
+  viewProduct(request: ViewProductRequest): Promise<Result<ViewProductResponse, SystemError>>;
+  manageCart(request: ManageCartRequest): Promise<Result<ManageCartResponse, SystemError>>;
+  /** Checks out the cart (UC-009); the cart lives in the browser, so only the UI channel can. */
+  checkOut(request: CheckOutRequest): Promise<Result<CheckOutResponse, SystemError>>;
+  /** Runs axe on the page the last step left open (FT Step 4); only the UI channel has pages. */
+  checkAccessibility(request: CheckAccessibilityRequest): Promise<Result<CheckAccessibilityResponse, SystemError>>;
+}

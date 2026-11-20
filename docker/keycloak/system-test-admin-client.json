@@ -1,0 +1,21 @@
+{
+  "clientId": "shop-system-test-admin",
+  "name": "System tests: user admin",
+  "description": "Service account the cloud acceptance tests use to create and delete test customers. Realm shop only; realm-management manage-users, view-users, query-users. Reconciled (with its secret) by .github/actions/deploy-keycloak.",
+  "enabled": true,
+  "protocol": "openid-connect",
+  "publicClient": false,
+  "bearerOnly": false,
+  "clientAuthenticatorType": "client-secret",
+  "serviceAccountsEnabled": true,
+  "standardFlowEnabled": false,
+  "implicitFlowEnabled": false,
+  "directAccessGrantsEnabled": false,
+  "frontchannelLogout": false,
+  "redirectUris": [],
+  "webOrigins": [],
+  "attributes": {
+    "oauth2.device.authorization.grant.enabled": "false",
+    "oidc.ciba.grant.enabled": "false"
+  }
+}

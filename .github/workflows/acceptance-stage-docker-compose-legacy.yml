@@ -1,0 +1,39 @@
+name: acceptance-stage-docker-compose-legacy
+
+run-name: >-
+  acceptance-stage-docker-compose-legacy${{ inputs.commit-sha && format(' [sha:{0}]', inputs.commit-sha) || ' [latest-image]' }}
+
+# Docker Compose acceptance gate, legacy suites. Runs hourly, like the latest gate.
+# Gate only: no RC tag. Legacy never runs on cloud. A project that drops legacy deletes this file
+# (and its legacy system tests).
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # Run every hour
+  workflow_dispatch:
+    inputs:
+      commit-sha:
+        description: 'Git SHA to test (leave empty for latest image)'
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: acceptance-stage-docker-compose-legacy
+
+jobs:
+  acceptance-stage:
+    permissions:
+      actions: write
+      contents: read
+      packages: read
+    uses: ./.github/workflows/_acceptance-stage-docker-compose.yml
+    secrets: inherit
+    with:
+      architecture: multitier
+      language: typescript
+      test-language: typescript
+      images: '{"frontend":"test-app-255a5205-d768fe28e72ea658-frontend/frontend","backend":"test-app-255a5205-d768fe28e72ea658-backend/backend"}'
+      commit-sha: ${{ inputs.commit-sha }}
+      suite-set: legacy
